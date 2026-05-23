@@ -11,12 +11,78 @@
 //! the panic stub with a real assertion that verifies the AC
 //! description above.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown, clippy::indexing_slicing, clippy::cast_lossless, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_panics_doc, clippy::many_single_char_names, clippy::as_conversions, clippy::panic, clippy::needless_pass_by_value, clippy::similar_names, clippy::tests_outside_test_module, clippy::needless_borrow)]
+
+mod common;
+
+use agorabus::Client;
+use common::DaemonHandle;
+use std::time::Duration;
 
 #[test]
 fn acceptance_ac5() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC5 not yet implemented — see file header");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let h = DaemonHandle::start().await;
+
+        // Subscriber connection.
+        let mut sub = Client::connect(&h.socket).await.unwrap();
+        sub.announce("sub-1", 1, "/tmp/sub", "subscriber").await.unwrap();
+        let r = sub.subscribe("shared.").await.unwrap();
+        assert!(r.ok);
+
+        // Allow subscribe state to land.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Publisher connection (separate from subscriber).
+        let mut pub_a = Client::connect(&h.socket).await.unwrap();
+        pub_a.announce("pub-1", 2, "/tmp/pub", "publisher").await.unwrap();
+
+        // Three publishes: two matching the prefix, one not.
+        pub_a
+            .publish("shared.lock-hint", serde_json::json!({"path": "/a"}))
+            .await
+            .unwrap();
+        pub_a
+            .publish("session.x.intent", serde_json::json!("non-matching"))
+            .await
+            .unwrap();
+        pub_a
+            .publish("shared.discovery", serde_json::json!({"k": "v"}))
+            .await
+            .unwrap();
+
+        // Collect two matching events.
+        let ev1 = tokio::time::timeout(Duration::from_secs(2), sub.next_event())
+            .await
+            .expect("recv event 1 in time")
+            .unwrap()
+            .unwrap();
+        let ev2 = tokio::time::timeout(Duration::from_secs(2), sub.next_event())
+            .await
+            .expect("recv event 2 in time")
+            .unwrap()
+            .unwrap();
+
+        // Topic prefix matched; non-matching event was filtered out.
+        for ev in [&ev1, &ev2] {
+            assert!(
+                ev.topic.starts_with("shared."),
+                "got event with topic {topic} (expected shared.* prefix)",
+                topic = ev.topic
+            );
+            assert_eq!(ev.from, "pub-1");
+        }
+        let topics: std::collections::BTreeSet<_> = [&ev1, &ev2]
+            .iter()
+            .map(|e| e.topic.clone())
+            .collect();
+        assert!(topics.contains("shared.lock-hint"), "got: {topics:?}");
+        assert!(topics.contains("shared.discovery"), "got: {topics:?}");
+
+        h.shutdown().await;
+    });
 }

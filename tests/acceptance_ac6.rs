@@ -11,12 +11,63 @@
 //! the panic stub with a real assertion that verifies the AC
 //! description above.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown, clippy::indexing_slicing, clippy::cast_lossless, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_panics_doc, clippy::many_single_char_names, clippy::as_conversions, clippy::panic, clippy::needless_pass_by_value, clippy::similar_names, clippy::tests_outside_test_module, clippy::needless_borrow)]
+
+use std::process::Command;
 
 #[test]
 fn acceptance_ac6() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC6 not yet implemented — see file header");
+    // No daemon running on this socket; the file does not exist.
+    let tmp = tempfile::tempdir().unwrap();
+    let nonexistent = tmp.path().join("absent.sock");
+
+    let bin = env!("CARGO_BIN_EXE_agorabus");
+
+    // (a) `agorabus peers --socket <nonexistent>` exits 0 with stdout == "[]\n".
+    let out = Command::new(bin)
+        .arg("--socket")
+        .arg(&nonexistent)
+        .arg("peers")
+        .output()
+        .expect("spawn agorabus peers");
+    assert!(
+        out.status.success(),
+        "peers should fail-open: status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "peers should emit empty JSON array, got {stdout:?}"
+    );
+
+    // (b) `agorabus announce ...` also exits 0 (no-op).
+    let out = Command::new(bin)
+        .arg("--socket")
+        .arg(&nonexistent)
+        .args(["announce", "--session-id", "x", "--cwd", "/", "--intent", ""])
+        .output()
+        .expect("spawn agorabus announce");
+    assert!(
+        out.status.success(),
+        "announce should fail-open: status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (c) `agorabus publish` also exits 0.
+    let out = Command::new(bin)
+        .arg("--socket")
+        .arg(&nonexistent)
+        .args(["publish", "shared.test", "\"hi\""])
+        .output()
+        .expect("spawn agorabus publish");
+    assert!(
+        out.status.success(),
+        "publish should fail-open: status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

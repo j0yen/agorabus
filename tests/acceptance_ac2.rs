@@ -11,12 +11,72 @@
 //! the panic stub with a real assertion that verifies the AC
 //! description above.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown, clippy::indexing_slicing, clippy::cast_lossless, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_panics_doc, clippy::many_single_char_names, clippy::as_conversions, clippy::panic, clippy::needless_pass_by_value, clippy::similar_names, clippy::tests_outside_test_module, clippy::needless_borrow)]
+
+mod common;
+
+use common::DaemonHandle;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 #[test]
 fn acceptance_ac2() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC2 not yet implemented — see file header");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let h = DaemonHandle::start().await;
+
+        // (a) Happy path: first message is announce -> {"ok":true}.
+        {
+            let stream = UnixStream::connect(&h.socket).await.expect("connect");
+            let (r, mut w) = stream.into_split();
+            let mut reader = BufReader::new(r).lines();
+            let announce = serde_json::json!({
+                "op": "announce",
+                "session_id": "ac2-happy",
+                "pid": 1u32,
+                "cwd": "/tmp/ac2",
+                "intent": ""
+            });
+            let mut bytes = announce.to_string().into_bytes();
+            bytes.push(b'\n');
+            w.write_all(&bytes).await.unwrap();
+            w.flush().await.unwrap();
+            let line = reader
+                .next_line()
+                .await
+                .unwrap()
+                .expect("happy reply line");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        }
+
+        // (b) Negative path: first message is publish -> announce_required.
+        {
+            let stream = UnixStream::connect(&h.socket).await.expect("connect");
+            let (r, mut w) = stream.into_split();
+            let mut reader = BufReader::new(r).lines();
+            let bad = serde_json::json!({
+                "op": "publish",
+                "topic": "shared.x",
+                "data": "hi"
+            });
+            let mut bytes = bad.to_string().into_bytes();
+            bytes.push(b'\n');
+            w.write_all(&bytes).await.unwrap();
+            w.flush().await.unwrap();
+            let line = reader
+                .next_line()
+                .await
+                .unwrap()
+                .expect("error reply line");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["ok"], serde_json::Value::Bool(false));
+            assert_eq!(v["error"], serde_json::Value::String("announce_required".into()));
+        }
+
+        h.shutdown().await;
+    });
 }

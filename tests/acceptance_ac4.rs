@@ -11,12 +11,91 @@
 //! the panic stub with a real assertion that verifies the AC
 //! description above.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown, clippy::indexing_slicing, clippy::cast_lossless, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_panics_doc, clippy::many_single_char_names, clippy::as_conversions, clippy::panic, clippy::needless_pass_by_value, clippy::similar_names, clippy::tests_outside_test_module, clippy::needless_borrow)]
+
+mod common;
+
+use agorabus::Client;
+use common::DaemonHandle;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 #[test]
 fn acceptance_ac4() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC4 not yet implemented — see file header");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        // Short heartbeat timeout so the test runs in seconds, not a minute.
+        let h = DaemonHandle::start_with_timeout(Duration::from_secs(1)).await;
+
+        // (a) Heartbeat update: updates last_heartbeat_unix_secs on the peer.
+        let stream = UnixStream::connect(&h.socket).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r).lines();
+        // Announce.
+        let mut buf = serde_json::to_vec(&serde_json::json!({
+            "op": "announce",
+            "session_id": "ac4-stale",
+            "pid": 1u32,
+            "cwd": "/tmp/ac4-stale",
+            "intent": ""
+        }))
+        .unwrap();
+        buf.push(b'\n');
+        w.write_all(&buf).await.unwrap();
+        w.flush().await.unwrap();
+        let _ = reader.next_line().await.unwrap().unwrap();
+
+        // Send one heartbeat (with `tool`).
+        let mut hb = serde_json::to_vec(&serde_json::json!({
+            "op": "heartbeat",
+            "tool": "Bash"
+        }))
+        .unwrap();
+        hb.push(b'\n');
+        w.write_all(&hb).await.unwrap();
+        w.flush().await.unwrap();
+        let line = reader.next_line().await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+
+        // (b) Query peers via a separate, freshly-announced client; "ac4-stale" is present.
+        {
+            let mut q = Client::connect(&h.socket).await.unwrap();
+            q.announce("ac4-querier-1", 99, "/tmp", "q").await.unwrap();
+            let peers = q.peers().await.unwrap();
+            let sids: std::collections::BTreeSet<_> =
+                peers.iter().map(|p| p.session_id.clone()).collect();
+            assert!(sids.contains("ac4-stale"), "peer present: {sids:?}");
+            let rec = peers.iter().find(|p| p.session_id == "ac4-stale").unwrap();
+            assert_eq!(rec.last_tool, "Bash", "heartbeat updated last_tool");
+        }
+
+        // (c) Sleep past the heartbeat timeout; peer should be pruned. The
+        // peer's UnixStream is still alive (we hold it) but we stopped
+        // sending heartbeats.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        {
+            let mut q = Client::connect(&h.socket).await.unwrap();
+            q.announce("ac4-querier-2", 99, "/tmp", "q").await.unwrap();
+            let peers = q.peers().await.unwrap();
+            let sids: std::collections::BTreeSet<_> =
+                peers.iter().map(|p| p.session_id.clone()).collect();
+            assert!(
+                !sids.contains("ac4-stale"),
+                "stale peer pruned after timeout, got {sids:?}"
+            );
+        }
+
+        // Keep the connection alive until end-of-test to confirm pruning is
+        // by *heartbeat-age*, not by *disconnect*.
+        drop(w);
+        drop(reader);
+
+        h.shutdown().await;
+    });
 }

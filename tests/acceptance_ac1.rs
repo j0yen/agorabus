@@ -11,12 +11,48 @@
 //! the panic stub with a real assertion that verifies the AC
 //! description above.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown, clippy::indexing_slicing, clippy::cast_lossless, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_panics_doc, clippy::many_single_char_names, clippy::as_conversions, clippy::panic, clippy::needless_pass_by_value, clippy::similar_names, clippy::tests_outside_test_module, clippy::needless_borrow)]
+
+mod common;
+
+use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
+
+use agorabus::Client;
+use common::DaemonHandle;
 
 #[test]
 fn acceptance_ac1() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC1 not yet implemented — see file header");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let h = DaemonHandle::start_with_timeout(Duration::from_secs(60)).await;
+
+        // (a) Socket file exists.
+        let meta = std::fs::metadata(&h.socket).expect("socket file exists");
+
+        // (b) Socket file mode is 0600.
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket file mode = {mode:o}, want 0600");
+
+        // (c) Parent directory has mode 0700.
+        let parent = h.socket.parent().expect("socket has parent");
+        let pmeta = std::fs::metadata(parent).expect("parent metadata");
+        let pmode = pmeta.permissions().mode() & 0o777;
+        assert_eq!(pmode, 0o700, "parent dir mode = {pmode:o}, want 0700");
+
+        // (d) Daemon accepts a connection.
+        let mut client = Client::connect(&h.socket).await.expect("client connect");
+
+        // (e) Daemon responds to a valid announce.
+        let reply = client
+            .announce("ac1-session", 12345, "/tmp/ac1", "")
+            .await
+            .expect("announce ok");
+        assert!(reply.ok, "announce reply ok=false: {:?}", reply.error);
+
+        h.shutdown().await;
+    });
 }

@@ -11,12 +11,66 @@
 //! the panic stub with a real assertion that verifies the AC
 //! description above.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown, clippy::indexing_slicing, clippy::cast_lossless, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_panics_doc, clippy::many_single_char_names, clippy::as_conversions, clippy::panic, clippy::needless_pass_by_value, clippy::similar_names, clippy::tests_outside_test_module, clippy::needless_borrow)]
+
+mod common;
+
+use agorabus::Client;
+use common::DaemonHandle;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 #[test]
 fn acceptance_ac7() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC7 not yet implemented — see file header");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let h = DaemonHandle::start().await;
+
+        // (a) Non-JSON garbage as first message.
+        {
+            let stream = UnixStream::connect(&h.socket).await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut reader = BufReader::new(r).lines();
+            w.write_all(b"this is not JSON\n").await.unwrap();
+            w.flush().await.unwrap();
+            let line = reader.next_line().await.unwrap().expect("error reply line");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["ok"], serde_json::Value::Bool(false));
+            assert_eq!(v["error"], serde_json::Value::String("malformed_json".into()));
+            // Connection closed by daemon: next line should be EOF.
+            let eof = reader.next_line().await.unwrap();
+            assert!(eof.is_none(), "expected EOF, got {eof:?}");
+        }
+
+        // (b) JSON object missing `op` -> rejected.
+        {
+            let stream = UnixStream::connect(&h.socket).await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut reader = BufReader::new(r).lines();
+            w.write_all(b"{\"session_id\":\"x\"}\n").await.unwrap();
+            w.flush().await.unwrap();
+            let line = reader.next_line().await.unwrap().expect("error reply line");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["ok"], serde_json::Value::Bool(false));
+            // serde will fail to decode (missing `op` tag) -> malformed_json.
+            assert_eq!(v["error"], serde_json::Value::String("malformed_json".into()));
+        }
+
+        // (c) Other clients unaffected: a fresh, well-formed client still works.
+        {
+            let mut ok = Client::connect(&h.socket).await.unwrap();
+            let reply = ok.announce("ac7-survivor", 42, "/tmp", "alive").await.unwrap();
+            assert!(reply.ok);
+            let peers = ok.peers().await.unwrap();
+            assert!(
+                peers.iter().any(|p| p.session_id == "ac7-survivor"),
+                "survivor present in peers"
+            );
+        }
+
+        h.shutdown().await;
+    });
 }

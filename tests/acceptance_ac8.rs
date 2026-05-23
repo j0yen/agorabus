@@ -11,12 +11,89 @@
 //! the panic stub with a real assertion that verifies the AC
 //! description above.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown, clippy::indexing_slicing, clippy::cast_lossless, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_panics_doc, clippy::many_single_char_names, clippy::as_conversions, clippy::panic, clippy::needless_pass_by_value, clippy::similar_names, clippy::tests_outside_test_module, clippy::needless_borrow)]
+
+mod common;
+
+use agorabus::Client;
+use common::DaemonHandle;
+use std::time::Duration;
 
 #[test]
 fn acceptance_ac8() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC8 not yet implemented — see file header");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let h = DaemonHandle::start().await;
+        let n = 4_usize; // proptest-style smaller fan-out per AC description.
+
+        // (a) Start N subscribers, all subscribed to "shared.".
+        let mut subs: Vec<Client> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut c = Client::connect(&h.socket).await.unwrap();
+            c.announce(&format!("sub-{i}"), i as u32, "/tmp", "sub")
+                .await
+                .unwrap();
+            let r = c.subscribe("shared.").await.unwrap();
+            assert!(r.ok);
+            subs.push(c);
+        }
+
+        // Let subscribers settle.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // (b) Start N publishers, each publishes one event on a unique topic.
+        for i in 0..n {
+            let mut p = Client::connect(&h.socket).await.unwrap();
+            p.announce(&format!("pub-{i}"), (1000 + i) as u32, "/tmp", "pub")
+                .await
+                .unwrap();
+            p.publish(
+                &format!("shared.fanout.{i}"),
+                serde_json::json!({"i": i}),
+            )
+            .await
+            .unwrap();
+            // Drop publisher; daemon retains the broadcast send.
+            drop(p);
+        }
+
+        // (c) Each subscriber should have seen all N events.
+        for (i, sub) in subs.iter_mut().enumerate() {
+            let mut seen_topics: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for _ in 0..n {
+                let ev = tokio::time::timeout(Duration::from_secs(3), sub.next_event())
+                    .await
+                    .unwrap_or_else(|_| panic!("sub-{i} timed out"))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("sub-{i} EOF before all events"));
+                seen_topics.insert(ev.topic);
+            }
+            for j in 0..n {
+                let want = format!("shared.fanout.{j}");
+                assert!(
+                    seen_topics.contains(&want),
+                    "sub-{i} missing {want}: got {seen_topics:?}"
+                );
+            }
+        }
+
+        // (d) Announce records preserved: each "sub-i" and "pub-i" peer that
+        //     is still connected appears in peers (publishers disconnected
+        //     above, so only subscribers must remain).
+        let mut q = Client::connect(&h.socket).await.unwrap();
+        q.announce("ac8-querier", 9999, "/tmp", "q").await.unwrap();
+        let peers = q.peers().await.unwrap();
+        let sids: std::collections::BTreeSet<_> =
+            peers.iter().map(|p| p.session_id.clone()).collect();
+        for i in 0..n {
+            let want = format!("sub-{i}");
+            assert!(sids.contains(&want), "subscriber peer {want} dropped: {sids:?}");
+        }
+
+        h.shutdown().await;
+    });
 }

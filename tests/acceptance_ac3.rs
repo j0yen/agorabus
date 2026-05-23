@@ -11,12 +11,71 @@
 //! the panic stub with a real assertion that verifies the AC
 //! description above.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown, clippy::indexing_slicing, clippy::cast_lossless, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_panics_doc, clippy::many_single_char_names, clippy::as_conversions, clippy::panic, clippy::needless_pass_by_value, clippy::similar_names, clippy::tests_outside_test_module, clippy::needless_borrow)]
+
+mod common;
+
+use agorabus::Client;
+use common::DaemonHandle;
+use std::process::Command;
 
 #[test]
 fn acceptance_ac3() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC3 not yet implemented — see file header");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let h = DaemonHandle::start().await;
+
+        // Two long-lived peer connections.
+        let mut a = Client::connect(&h.socket).await.unwrap();
+        a.announce("peer-A", 111, "/tmp/A", "doing-A").await.unwrap();
+        let mut b = Client::connect(&h.socket).await.unwrap();
+        b.announce("peer-B", 222, "/tmp/B", "doing-B").await.unwrap();
+
+        // (a) Library client: peers() returns at least these two peers.
+        let mut q = Client::connect(&h.socket).await.unwrap();
+        q.announce("peer-Q", 333, "/tmp/Q", "querying").await.unwrap();
+        let peers = q.peers().await.unwrap();
+        let sids: std::collections::BTreeSet<_> =
+            peers.iter().map(|p| p.session_id.clone()).collect();
+        assert!(sids.contains("peer-A"), "peer-A in {sids:?}");
+        assert!(sids.contains("peer-B"), "peer-B in {sids:?}");
+        // Required fields populated:
+        let a_rec = peers.iter().find(|p| p.session_id == "peer-A").unwrap();
+        assert_eq!(a_rec.pid, 111);
+        assert_eq!(a_rec.cwd, "/tmp/A");
+        assert_eq!(a_rec.intent, "doing-A");
+        assert!(a_rec.last_heartbeat_unix_secs > 0);
+
+        // (b) CLI `agorabus peers --socket <path>` returns JSON array on stdout.
+        let bin = env!("CARGO_BIN_EXE_agorabus");
+        let out = Command::new(bin)
+            .arg("--socket")
+            .arg(&h.socket)
+            .arg("peers")
+            .output()
+            .expect("spawn agorabus peers");
+        assert!(
+            out.status.success(),
+            "agorabus peers failed: status={:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("CLI stdout not JSON: {e}: {stdout:?}"));
+        assert!(parsed.is_array(), "CLI peers output not a JSON array");
+        let arr = parsed.as_array().unwrap();
+        // Must contain peer-A and peer-B; throwaway cli-peers-* is filtered out.
+        let names: std::collections::BTreeSet<String> = arr
+            .iter()
+            .filter_map(|v| v["session_id"].as_str().map(String::from))
+            .collect();
+        assert!(names.contains("peer-A"), "CLI peers missing peer-A: {names:?}");
+        assert!(names.contains("peer-B"), "CLI peers missing peer-B: {names:?}");
+
+        h.shutdown().await;
+    });
 }
