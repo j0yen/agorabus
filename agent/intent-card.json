@@ -1,0 +1,142 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "prd_source": "/home/jsy/projects/autobuilder/PRD-cross-session-bus.md",
+  "intent_slug": "agorabus",
+  "root_motivation": "Concurrent Claude sessions on the same laptop are mutually blind, leading to clobbered shared files (settings.json, recall DB) and redundant work. agorabus provides an advisory presence+pub/sub substrate over a Unix-domain socket so co-located sessions can announce themselves, see peers, and exchange low-volume coordination events.",
+  "user_persona": "Joe Yen running multiple concurrent Claude Code sessions on a single Linux laptop (single-user trust model). The CLI is invoked by SessionStart/Stop hooks and by Claude itself during a session for ad-hoc peer queries.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing_count",
+    "lower_is_better": false,
+    "harness_command": "scripts/run-metrics.sh",
+    "target": null
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "`agorabus daemon` starts a UDS server at ~/.cache/agorabus/sock (or path from --socket), creates parent dirs with 0700, sets the socket file mode to 0600, and accepts at least one client connection.",
+      "test": "tests/acceptance_ac1.rs"
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "Newline-delimited JSON protocol: the first message from a client must be an `announce` op carrying session_id, pid, cwd; the daemon replies with {\"ok\":true} and records the peer. Non-announce first messages get {\"ok\":false,\"error\":\"announce_required\"}.",
+      "test": "tests/acceptance_ac2.rs"
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "`agorabus peers --socket <path>` returns a JSON array of currently-connected peers with their announce records (session_id, pid, cwd, intent, last_heartbeat).",
+      "test": "tests/acceptance_ac3.rs"
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "Heartbeat semantics: a client may send {\"op\":\"heartbeat\",\"tool\":\"...\"} at any time; the daemon updates the peer's last_heartbeat. Peers with no heartbeat for more than the configured timeout (default 60s, override via --heartbeat-timeout) are pruned from the peers list.",
+      "test": "tests/acceptance_ac4.rs"
+    },
+    {
+      "id": "AC5",
+      "level": "MUST",
+      "description": "Pub/sub: a client subscribed via {\"op\":\"subscribe\",\"prefix\":\"shared.\"} receives every subsequent {\"op\":\"publish\",\"topic\":\"shared.X\",\"data\":...} whose topic begins with that prefix. Streamed as one JSON object per line on the subscriber's socket.",
+      "test": "tests/acceptance_ac5.rs"
+    },
+    {
+      "id": "AC6",
+      "level": "MUST",
+      "description": "Fail-open client: `agorabus peers` with no daemon running exits 0 and emits `[]` on stdout (PRD risk-mitigation requirement). All client subcommands treat connection-refused / no-socket as 'no peers / no bus' rather than as a hard error.",
+      "test": "tests/acceptance_ac6.rs"
+    },
+    {
+      "id": "AC7",
+      "level": "SHOULD",
+      "description": "JSON line protocol is robust to malformed input: a client sending non-JSON or a JSON object missing `op` receives an `{\"ok\":false,\"error\":...}` reply and the connection is closed; other clients are unaffected.",
+      "test": "tests/acceptance_ac7.rs"
+    },
+    {
+      "id": "AC8",
+      "level": "SHOULD",
+      "description": "Concurrent connections: the daemon serves at least 8 simultaneous clients without dropping announce records or pub/sub deliveries (proptest-style fan-out check at smaller N=4 in the acceptance test).",
+      "test": "tests/acceptance_ac8.rs"
+    }
+  ],
+  "scope": [
+    "Single multi-subcommand CLI binary `agorabus` (one of: daemon, announce, peers, publish, subscribe, heartbeat).",
+    "Unix-domain socket transport with newline-delimited JSON framing.",
+    "In-memory peer registry with heartbeat-based liveness; no on-disk persistence in v1.",
+    "Pub/sub with dotted-topic prefix subscription matching.",
+    "Fail-open client behavior: missing daemon never raises an error from a Claude session.",
+    "0600 socket permissions; relies on UDS uid filtering (single-user model)."
+  ],
+  "non_goals": [
+    "Cross-host federation, multi-machine sync.",
+    "Strong consistency or real mutual exclusion (advisory only; real locks belong to `flock`).",
+    "Persistent ring-buffer log to ndjson (Phase 1 in the PRD; deferred — daemon is memory-only in v1).",
+    "`send` targeted messages with opt-in receive (PRD Phase 2; deferred).",
+    "Sub-agent integration / `Skill(...)` dispatch interception (PRD Phase 3; deferred).",
+    "`/self-review` cross-session error aggregation (PRD Phase 4; deferred).",
+    "systemd-user-socket activation (one launch mode only in v1: explicit `agorabus daemon`).",
+    "TLS, ACLs, per-topic auth, or any non-uid auth beyond UDS file permissions.",
+    "Service-target (`--target service`) under autobuilder v1: this is a multi-subcommand CLI where `daemon` is one of several subcommands of the same binary."
+  ],
+  "hard_constraints": {
+    "rust_edition": "2024",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 12,
+    "msrv": "1.85",
+    "additional": {
+      "transport": "unix-domain-socket-only",
+      "framing": "newline-delimited-json",
+      "default_socket_path": "~/.cache/agorabus/sock",
+      "default_heartbeat_timeout_secs": "60",
+      "concurrency_model": "tokio-multi-thread"
+    }
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "Why build a Unix-socket pub/sub bus?",
+      "a": "Two concurrent Claude sessions today (PIDs 1202 and 1381) have no way to see each other and risk clobbering shared resources (settings.json, recall DB, MEMORY files)."
+    },
+    {
+      "why": 2,
+      "q": "Why does mutual blindness specifically matter (vs. relying on filesystem locks)?",
+      "a": "fs locks address the data race but not the semantic race — two sessions can independently decide to update the same memory in incompatible ways. Need *intent* visibility, not just *write* mutex."
+    },
+    {
+      "why": 3,
+      "q": "Why a long-lived bus rather than a watch-and-poll over a shared status file?",
+      "a": "Heartbeat + pub/sub gives clean crash detection (no heartbeat for 60s == gone) and pushes events to subscribers in real time; polling a file misses transient publishes and leaves dead-session detection to ad-hoc TTLs."
+    },
+    {
+      "why": 4,
+      "q": "Why does this need its own daemon rather than reusing dbus/systemd activation?",
+      "a": "Scope is agent-traffic-shaped (announce + topic prefix subscribe + heartbeat liveness), and a ~300 LoC tokio daemon is cheaper to own than the dbus learning curve. Trust model is single-uid; UDS perms suffice."
+    },
+    {
+      "why": 5,
+      "q": "Why is fail-open behavior load-bearing?",
+      "a": "If a Claude session ever *blocked* on the bus during its hot path, the bus would become a new SPOF for the agent. Fail-open means 'bus down == no peers known == proceed normally,' which keeps the bus advisory rather than authoritative."
+    }
+  ],
+  "ambiguities_resolved": [
+    {
+      "question": "PRD describes both Phase 0 (announce/peers/heartbeat) and Phases 1–4 (publish/subscribe, query-state, send, sub-agent integration, self-review). Which phases are in scope for v1?",
+      "resolution": "Phase 0 + Phase 1 (publish/subscribe with prefix matching) are MUST. Phases 2–4 are explicit non-goals. The MUST-AC set reflects this scope-narrowing."
+    },
+    {
+      "question": "PRD calls this a 'daemon' but autobuilder v1 supports only --target cli/lib. Service target is out of scope.",
+      "resolution": "Model as a multi-subcommand CLI where `agorabus daemon` is one subcommand. Same binary serves both client and server roles. This is exactly how the PRD describes the architecture (`agorabus daemon` is mentioned as embedded in the client)."
+    },
+    {
+      "question": "Should the ring-buffer event log (~/.cache/agorabus/log/YYYY-MM-DD.ndjson) be in v1?",
+      "resolution": "No. Deferred to a follow-up. v1 daemon is memory-only; replay-on-subscribe is not supported. This keeps the v1 surface within autobuilder's iteration budget."
+    },
+    {
+      "question": "Should `send` targeted messages with opt-in receive be in v1?",
+      "resolution": "No. PRD Phase 2. Pub/sub covers the coordination story; targeted send adds an inbox-subscription convention that doesn't pay off until Phase 3 sub-agent traffic exists."
+    }
+  ],
+  "created_at": "2026-05-23T00:00:00Z"
+}
