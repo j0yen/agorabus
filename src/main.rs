@@ -249,14 +249,50 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
                 .announce(&session_id, std::process::id(), &cwd, "subscriber")
                 .await?;
             let _ = client.subscribe(&prefix).await?;
+            let (mut write_half, mut reader) = client.into_halves();
+
+            // Keep `last_heartbeat_unix_secs` fresh so the daemon's
+            // peers-query prune (default 60s) doesn't drop a live
+            // subscriber. Tick at half the default timeout.
+            let heartbeat_handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(
+                    agorabus::DEFAULT_HEARTBEAT_TIMEOUT_SECS / 2,
+                ));
+                ticker.tick().await; // discard the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    if agorabus::client::send_heartbeat(&mut write_half, "")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+
             let mut received = 0_usize;
-            while let Some(ev) = client.next_event().await? {
-                println!("{}", serde_json::to_string(&ev)?);
-                received = received.saturating_add(1);
-                if max_events != 0 && received >= max_events {
+            loop {
+                let Some(line) = reader.next_line().await? else {
                     break;
+                };
+                let parsed: agorabus::client::InboundLine =
+                    match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                match parsed {
+                    agorabus::client::InboundLine::Reply(_) => continue,
+                    agorabus::client::InboundLine::Event(ev) => {
+                        println!("{}", serde_json::to_string(&ev)?);
+                        received = received.saturating_add(1);
+                        if max_events != 0 && received >= max_events {
+                            break;
+                        }
+                    }
                 }
             }
+            heartbeat_handle.abort();
+            let _ = heartbeat_handle.await;
             // Silence unused-must-use for the borrow of ServerEvent (lint
             // checker hint; not a real warning).
             let _ = std::any::TypeId::of::<ServerEvent>();

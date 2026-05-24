@@ -15,7 +15,39 @@ use anyhow::{Context as _, Result, anyhow};
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
-use tokio::net::unix::OwnedReadHalf;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+/// A line received from the daemon on a subscribed connection: either a
+/// streaming broadcast [`ServerEvent`] or a one-shot [`Reply`] to a request
+/// the client sent (e.g. a periodic heartbeat). Long-lived subscribe loops
+/// use this to demultiplex the two on the same wire.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+pub enum InboundLine {
+    /// Routed broadcast event from a publisher.
+    Event(ServerEvent),
+    /// Reply to a request the client sent over this connection.
+    Reply(Reply),
+}
+
+/// Send a single [`ClientMessage::Heartbeat`] over a raw write half. Used
+/// by long-lived subscribe loops to refresh the daemon's
+/// `last_heartbeat_unix_secs` without a reply read (the reply is consumed
+/// out-of-band by [`Client::next_event`], which skips [`InboundLine::Reply`]).
+///
+/// # Errors
+///
+/// Returns `Err` on serialization failure or write/flush I/O failure.
+pub async fn send_heartbeat(write: &mut OwnedWriteHalf, tool: &str) -> Result<()> {
+    let msg = ClientMessage::Heartbeat {
+        tool: tool.to_string(),
+    };
+    let mut buf = serde_json::to_vec(&msg).context("serializing heartbeat")?;
+    buf.push(b'\n');
+    write.write_all(&buf).await.context("send_heartbeat write")?;
+    write.flush().await.context("send_heartbeat flush")?;
+    Ok(())
+}
 
 /// A connected bus client.
 pub struct Client {
@@ -160,19 +192,35 @@ impl Client {
     }
 
     /// Read the next streaming `ServerEvent`. Returns `Ok(None)` on EOF.
+    /// Silently skips any [`InboundLine::Reply`] lines (e.g. replies to
+    /// heartbeats interleaved with broadcast events on a subscribed wire).
     ///
     /// # Errors
     ///
-    /// Returns `Err` on I/O failure or on a malformed event line.
+    /// Returns `Err` on I/O failure or on a line that decodes as neither
+    /// a `ServerEvent` nor a `Reply`.
     pub async fn next_event(&mut self) -> Result<Option<ServerEvent>> {
-        match self.reader.next_line().await? {
-            Some(line) => {
-                let ev: ServerEvent =
-                    serde_json::from_str(&line).context("decoding ServerEvent")?;
-                Ok(Some(ev))
+        loop {
+            match self.reader.next_line().await? {
+                Some(line) => {
+                    let parsed: InboundLine = serde_json::from_str(&line)
+                        .context("decoding inbound line")?;
+                    match parsed {
+                        InboundLine::Event(ev) => return Ok(Some(ev)),
+                        InboundLine::Reply(_) => continue,
+                    }
+                }
+                None => return Ok(None),
             }
-            None => Ok(None),
         }
+    }
+
+    /// Consume the client and return the raw `(write_half, line_reader)`
+    /// halves. Useful for subscribe loops that want to interleave reads
+    /// with a periodic heartbeat task running on a separate tokio task.
+    #[must_use]
+    pub fn into_halves(self) -> (OwnedWriteHalf, tokio::io::Lines<BufReader<OwnedReadHalf>>) {
+        (self.write, self.reader)
     }
 
     async fn send_line<T: serde::Serialize>(&mut self, value: &T) -> Result<()> {
