@@ -25,6 +25,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -60,12 +61,20 @@ impl DaemonConfig {
 struct BusState {
     // session_id -> record
     peers: HashMap<String, PeerRecord>,
+    // session_id -> id of the connection that originally announced (and
+    // therefore owns) this peer record. A guest connection that re-announces
+    // the same session_id (e.g. a one-shot `publish --session-id <existing>`)
+    // does not take ownership and does not get to remove the record on
+    // disconnect. Without this, any one-shot client reusing a long-lived
+    // peer's session_id would wipe the long-lived peer's record.
+    peer_owners: HashMap<String, u64>,
 }
 
 impl BusState {
     fn new() -> Self {
         Self {
             peers: HashMap::new(),
+            peer_owners: HashMap::new(),
         }
     }
 }
@@ -119,6 +128,7 @@ pub async fn run_daemon(
     let state = Arc::new(Mutex::new(BusState::new()));
     let (bcast_tx, _) = broadcast::channel::<BroadcastMsg>(config.broadcast_capacity);
     let heartbeat_timeout = config.heartbeat_timeout;
+    let conn_counter = AtomicU64::new(0);
 
     loop {
         tokio::select! {
@@ -131,8 +141,9 @@ pub async fn run_daemon(
                     Ok((stream, _addr)) => {
                         let state = Arc::clone(&state);
                         let bcast = bcast_tx.clone();
+                        let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, state, bcast, heartbeat_timeout).await {
+                            if let Err(e) = handle_connection(stream, state, bcast, heartbeat_timeout, conn_id).await {
                                 // Per-connection errors are noisy in normal operation
                                 // (clients disconnect). Drop without polluting stdout/stderr.
                                 let _ = e;
@@ -154,6 +165,7 @@ async fn handle_connection(
     state: Arc<Mutex<BusState>>,
     bcast: broadcast::Sender<BroadcastMsg>,
     heartbeat_timeout: Duration,
+    conn_id: u64,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
@@ -178,6 +190,7 @@ async fn handle_connection(
                                 &bcast,
                                 &mut write_half,
                                 heartbeat_timeout,
+                                conn_id,
                             ).await?;
                         }
                         Ok(None) | Err(_) => break,
@@ -212,6 +225,7 @@ async fn handle_connection(
                         &bcast,
                         &mut write_half,
                         heartbeat_timeout,
+                        conn_id,
                     )
                     .await?;
                 }
@@ -220,10 +234,15 @@ async fn handle_connection(
         }
     }
 
-    // Connection closed: drop the peer record if we had one.
+    // Connection closed: drop the peer record only if this connection owns
+    // it. A guest connection (one that re-announced an already-owned
+    // session_id) does not delete the long-lived owner's record.
     if let Some(sid) = session_id {
         let mut st = state.lock().await;
-        st.peers.remove(&sid);
+        if st.peer_owners.get(&sid).copied() == Some(conn_id) {
+            st.peers.remove(&sid);
+            st.peer_owners.remove(&sid);
+        }
     }
 
     Ok(())
@@ -239,6 +258,7 @@ async fn handle_line<W>(
     bcast: &broadcast::Sender<BroadcastMsg>,
     write_half: &mut W,
     heartbeat_timeout: Duration,
+    conn_id: u64,
 ) -> Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -266,18 +286,26 @@ where
                 cwd,
                 intent,
             } => {
-                let record = PeerRecord {
-                    session_id: sid.clone(),
-                    pid: *pid,
-                    cwd: cwd.clone(),
-                    intent: intent.clone(),
-                    last_tool: String::new(),
-                    last_heartbeat_unix_secs: now_unix_secs(),
-                    extra: Default::default(),
-                };
                 {
                     let mut st = state.lock().await;
-                    st.peers.insert(sid.clone(), record);
+                    // Only claim ownership and (re)insert the peer record if
+                    // no other connection currently owns this session_id.
+                    // Otherwise this connection becomes a guest: the existing
+                    // peer record is left untouched, and the guest's eventual
+                    // disconnect will not remove it.
+                    if !st.peer_owners.contains_key(sid) {
+                        let record = PeerRecord {
+                            session_id: sid.clone(),
+                            pid: *pid,
+                            cwd: cwd.clone(),
+                            intent: intent.clone(),
+                            last_tool: String::new(),
+                            last_heartbeat_unix_secs: now_unix_secs(),
+                            extra: Default::default(),
+                        };
+                        st.peers.insert(sid.clone(), record);
+                        st.peer_owners.insert(sid.clone(), conn_id);
+                    }
                 }
                 *session_id = Some(sid.clone());
                 write_json_line(write_half, &Reply::ok()).await?;
