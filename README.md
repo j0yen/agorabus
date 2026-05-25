@@ -2,6 +2,24 @@
 
 > Concurrent Claude sessions on the same laptop are mutually blind, leading to clobbered shared files (settings.json, recall DB) and redundant work.
 
+## Install
+
+### One-liner
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/j0yen/agorabus/main/install.sh | bash
+```
+
+### Manual
+
+```sh
+git clone --depth 1 https://github.com/j0yen/agorabus.git
+cd agorabus
+./install.sh
+```
+
+Installs the `agorabus` binary via `cargo install --path . --locked`. Requires `cargo` / `rustc 1.85+` and `git`. Built binary lands in `~/.cargo/bin/`.
+
 ## Why
 
 Concurrent Claude sessions on the same laptop are mutually blind, leading to clobbered shared files (settings.json, recall DB) and redundant work. agorabus provides an advisory presence+pub/sub substrate over a Unix-domain socket so co-located sessions can announce themselves, see peers, and exchange low-volume coordination events.
