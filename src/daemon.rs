@@ -310,6 +310,9 @@ where
                             cwd: cwd.clone(),
                             intent: intent.clone(),
                             last_tool: String::new(),
+                            skill: String::new(),
+                            prd_slug: String::new(),
+                            working_paths: Vec::new(),
                             last_heartbeat_unix_secs: now_unix_secs(),
                             extra: Default::default(),
                         };
@@ -349,12 +352,32 @@ where
             drop(st);
             write_json_line(write_half, &Reply::ok()).await?;
         }
-        ClientMessage::Heartbeat { tool } => {
+        ClientMessage::Heartbeat {
+            tool,
+            skill,
+            prd_slug,
+            working_paths,
+        } => {
+            if let Some(ref paths) = working_paths
+                && paths.len() > crate::protocol::MAX_WORKING_PATHS
+            {
+                write_json_line(write_half, &Reply::error("too_many_paths")).await?;
+                return Ok(());
+            }
             let mut st = state.lock().await;
             if let Some(rec) = st.peers.get_mut(&sid) {
                 rec.last_heartbeat_unix_secs = now_unix_secs();
                 if !tool.is_empty() {
                     rec.last_tool = tool;
+                }
+                if let Some(s) = skill {
+                    rec.skill = s;
+                }
+                if let Some(p) = prd_slug {
+                    rec.prd_slug = p;
+                }
+                if let Some(paths) = working_paths {
+                    rec.working_paths = paths;
                 }
             }
             drop(st);

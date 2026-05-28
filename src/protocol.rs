@@ -25,12 +25,33 @@ pub struct PeerRecord {
     /// Last tool the session used, if reported (heartbeat carries this).
     #[serde(default)]
     pub last_tool: String,
+    /// Skill the session is currently inside, if reported via a structured
+    /// heartbeat or `intent set`. Sticky: set once, persists until cleared
+    /// by an empty value.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skill: String,
+    /// PRD slug the session is currently building, if reported via a
+    /// structured heartbeat or `intent set`. Sticky.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prd_slug: String,
+    /// Working paths the session is touching. Sticky; bounded to
+    /// [`MAX_WORKING_PATHS`] entries by the daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_paths: Vec<String>,
     /// UNIX timestamp (seconds) of the most recent message from this peer.
     pub last_heartbeat_unix_secs: u64,
     /// Free-form additional metadata.
     #[serde(default)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
+
+/// Maximum number of entries allowed in [`PeerRecord::working_paths`].
+///
+/// Heartbeats carrying more than this are rejected with
+/// `{"ok":false,"error":"too_many_paths"}`. The cap keeps the per-peer
+/// memory footprint bounded and discourages serializing an entire
+/// project tree into the bus.
+pub const MAX_WORKING_PATHS: usize = 8;
 
 /// Incoming message from a client.
 ///
@@ -62,11 +83,31 @@ pub enum ClientMessage {
         intent: Option<String>,
     },
     /// Heartbeat: refreshes `last_heartbeat_unix_secs` and (optionally)
-    /// `last_tool`.
+    /// `last_tool` plus the structured intent fields.
+    ///
+    /// `skill`, `prd_slug`, and `working_paths` follow sticky semantics:
+    /// a heartbeat that omits a field leaves the prior value in place;
+    /// an explicit empty string (or empty vector) clears it. This keeps
+    /// the wire small for the common heartbeat-with-just-tool case while
+    /// letting an `intent set` invocation update structured fields in
+    /// place.
     Heartbeat {
         /// Name of the most recent tool invocation (optional).
         #[serde(default)]
         tool: String,
+        /// Skill currently active in this session, if any. `Some("")`
+        /// explicitly clears the prior skill; `None` (field omitted)
+        /// leaves it sticky.
+        #[serde(default)]
+        skill: Option<String>,
+        /// PRD slug currently being built, if any. Same sticky semantics
+        /// as `skill`.
+        #[serde(default)]
+        prd_slug: Option<String>,
+        /// Working paths the session is touching, if any. `Some(vec![])`
+        /// explicitly clears; `None` leaves sticky.
+        #[serde(default)]
+        working_paths: Option<Vec<String>>,
     },
     /// Publish an event on a topic. All matching subscribers see it.
     Publish {

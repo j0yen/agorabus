@@ -41,6 +41,9 @@ pub enum InboundLine {
 pub async fn send_heartbeat(write: &mut OwnedWriteHalf, tool: &str) -> Result<()> {
     let msg = ClientMessage::Heartbeat {
         tool: tool.to_string(),
+        skill: None,
+        prd_slug: None,
+        working_paths: None,
     };
     let mut buf = serde_json::to_vec(&msg).context("serializing heartbeat")?;
     buf.push(b'\n');
@@ -141,6 +144,32 @@ impl Client {
     pub async fn heartbeat(&mut self, tool: &str) -> Result<Reply> {
         let msg = ClientMessage::Heartbeat {
             tool: tool.to_string(),
+            skill: None,
+            prd_slug: None,
+            working_paths: None,
+        };
+        self.request(&msg).await
+    }
+
+    /// Send a heartbeat carrying optional structured intent fields. Pass
+    /// `Some("")` (or `Some(vec![])`) to explicitly clear a field;
+    /// `None` leaves the daemon-side value sticky.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Self::request`].
+    pub async fn heartbeat_with_intent(
+        &mut self,
+        tool: &str,
+        skill: Option<String>,
+        prd_slug: Option<String>,
+        working_paths: Option<Vec<String>>,
+    ) -> Result<Reply> {
+        let msg = ClientMessage::Heartbeat {
+            tool: tool.to_string(),
+            skill,
+            prd_slug,
+            working_paths,
         };
         self.request(&msg).await
     }

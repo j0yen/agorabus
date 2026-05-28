@@ -117,6 +117,38 @@ enum Command {
     /// Advisory soft-locks on filesystem paths (PRD-chord-claim).
     #[command(subcommand)]
     Claim(ClaimCommand),
+    /// Structured per-session intent: skill / PRD slug / working paths
+    /// (PRD-chord-intent-rich).
+    #[command(subcommand)]
+    Intent(IntentCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum IntentCommand {
+    /// Publish structured intent for the calling session via a single
+    /// heartbeat. All intent flags are optional and sticky: omitting a flag
+    /// leaves the daemon-side value untouched; passing an empty value
+    /// (e.g. `--skill ""` or `--paths ""`) clears it. Fail-open: with no
+    /// daemon running, exits 0 silently.
+    Set {
+        /// Session id to set intent for (must match the session's announce id).
+        #[arg(long)]
+        session_id: String,
+        /// Skill currently active (e.g. `/build`). Omit to leave sticky.
+        #[arg(long)]
+        skill: Option<String>,
+        /// PRD slug currently being built. Omit to leave sticky.
+        #[arg(long)]
+        prd: Option<String>,
+        /// Comma-separated working paths (max 8). Omit to leave sticky;
+        /// pass an empty string to clear.
+        #[arg(long)]
+        paths: Option<String>,
+    },
+    /// List peers that have any structured intent field set, projecting only
+    /// `session_id` plus the set intent fields. Fail-open: emits `[]` and
+    /// exits 0 when no daemon is reachable.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -350,6 +382,7 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Claim(sub) => run_claim(sub, &socket).await,
+        Command::Intent(sub) => run_intent(sub, &socket).await,
         Command::Heartbeat { session_id, tool } => {
             let Some(mut client) = Client::try_connect(&socket).await? else {
                 return Ok(ExitCode::SUCCESS);
@@ -564,6 +597,103 @@ async fn run_claim(sub: ClaimCommand, socket: &PathBuf) -> Result<ExitCode> {
                     println!("{}", serde_json::to_string(&claims)?);
                 }
             }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+async fn run_intent(sub: IntentCommand, socket: &PathBuf) -> Result<ExitCode> {
+    match sub {
+        IntentCommand::Set {
+            session_id,
+            skill,
+            prd,
+            paths,
+        } => {
+            let Some(mut client) = Client::try_connect(socket).await? else {
+                // Fail-open: no daemon → no-op, silent (AC6).
+                return Ok(ExitCode::SUCCESS);
+            };
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_default();
+            let _ = client
+                .announce(&session_id, std::process::id(), &cwd, "intent-client")
+                .await?;
+            // Comma-split paths; an explicit empty string clears (Some(vec![]));
+            // omitting --paths leaves the field sticky (None).
+            let working_paths = paths.map(|s| {
+                if s.is_empty() {
+                    Vec::new()
+                } else {
+                    s.split(',').map(|p| p.trim().to_string()).collect()
+                }
+            });
+            // Empty tool ⇒ daemon leaves last_tool untouched (AC3: tool unset).
+            let reply = client
+                .heartbeat_with_intent("", skill, prd, working_paths)
+                .await?;
+            println!("{}", serde_json::to_string(&reply)?);
+            Ok(if reply.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        IntentCommand::List => {
+            let Some(mut client) = Client::try_connect(socket).await? else {
+                println!("[]");
+                return Ok(ExitCode::SUCCESS);
+            };
+            let cli_pid = std::process::id();
+            let sid = format!("cli-intent-list-{cli_pid}");
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_default();
+            let _ = client
+                .announce(&sid, cli_pid, &cwd, "intent-list-query")
+                .await?;
+            let peers = client.peers().await?;
+            // Keep only peers carrying at least one structured intent field;
+            // drop the throwaway query identity; project to session_id + the
+            // set intent fields (no pid/cwd/last_tool/etc) per AC4.
+            let projected: Vec<serde_json::Value> = peers
+                .into_iter()
+                .filter(|p| p.session_id != sid)
+                .filter(|p| {
+                    !p.skill.is_empty()
+                        || !p.prd_slug.is_empty()
+                        || !p.working_paths.is_empty()
+                })
+                .map(|p| {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "session_id".into(),
+                        serde_json::Value::String(p.session_id),
+                    );
+                    if !p.skill.is_empty() {
+                        m.insert("skill".into(), serde_json::Value::String(p.skill));
+                    }
+                    if !p.prd_slug.is_empty() {
+                        m.insert("prd_slug".into(), serde_json::Value::String(p.prd_slug));
+                    }
+                    if !p.working_paths.is_empty() {
+                        m.insert(
+                            "working_paths".into(),
+                            serde_json::Value::Array(
+                                p.working_paths
+                                    .into_iter()
+                                    .map(serde_json::Value::String)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    serde_json::Value::Object(m)
+                })
+                .collect();
+            println!("{}", serde_json::to_string(&projected)?);
             Ok(ExitCode::SUCCESS)
         }
     }
