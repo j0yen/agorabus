@@ -84,6 +84,53 @@ pub enum ClientMessage {
     },
     /// One-shot snapshot of all currently-live peers.
     Peers {},
+    /// Acquire an advisory claim on `path`. Path is expected to be already
+    /// canonicalized by the client. Refuses (returns `claim_conflict`) when
+    /// an active claim from a different session is held on the same path,
+    /// unless `force` is true. Same-session re-acquire is a renewal (TTL
+    /// bumped, no error). On success the daemon broadcasts on topic
+    /// `claim.acquire` with payload
+    /// `{path, session_id, ttl_unix_secs, reason}`.
+    ClaimAcquire {
+        /// Canonicalized absolute path the claim covers.
+        path: String,
+        /// UNIX-seconds wall time at which the claim expires.
+        ttl_unix_secs: u64,
+        /// Free-form rationale shown to peers in `claim list`.
+        #[serde(default)]
+        reason: String,
+        /// If true, evict any existing claim from a different session.
+        #[serde(default)]
+        force: bool,
+    },
+    /// Release the claim this session holds on `path`. Idempotent: releasing
+    /// an unknown path returns `ok` with `{released: false}`. On a real
+    /// release the daemon broadcasts on topic `claim.release` with payload
+    /// `{path, session_id}`.
+    ClaimRelease {
+        /// Canonicalized absolute path the claim covers.
+        path: String,
+    },
+    /// Snapshot of all currently-active claims. Expired claims are pruned
+    /// silently before returning. Reply payload is `Vec<ClaimRecord>`.
+    ClaimList {},
+}
+
+/// Daemon-side record of an active advisory claim. Returned in the
+/// `ClaimList` payload and embedded in `claim_conflict` error details.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimRecord {
+    /// Canonicalized absolute path the claim covers.
+    pub path: String,
+    /// Session that holds the claim.
+    pub session_id: String,
+    /// Wall-clock UNIX seconds at which the claim expires.
+    pub ttl_unix_secs: u64,
+    /// UNIX seconds at which the claim was acquired (or last renewed).
+    pub acquired_unix_secs: u64,
+    /// Free-form rationale (may be empty).
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// Server reply (one-shot, line-framed).

@@ -19,7 +19,7 @@
     clippy::default_trait_access,
 )]
 
-use crate::protocol::{ClientMessage, PeerRecord, Reply, ServerEvent};
+use crate::protocol::{ClaimRecord, ClientMessage, PeerRecord, Reply, ServerEvent};
 use anyhow::{Context as _, Result};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -68,6 +68,9 @@ struct BusState {
     // disconnect. Without this, any one-shot client reusing a long-lived
     // peer's session_id would wipe the long-lived peer's record.
     peer_owners: HashMap<String, u64>,
+    // canonical_path -> active claim. In-memory only; dropped on daemon
+    // restart per PRD-chord-claim §State persistence.
+    claims: HashMap<String, ClaimRecord>,
 }
 
 impl BusState {
@@ -75,7 +78,14 @@ impl BusState {
         Self {
             peers: HashMap::new(),
             peer_owners: HashMap::new(),
+            claims: HashMap::new(),
         }
+    }
+
+    // Drop any claim whose ttl_unix_secs <= now. Called before any
+    // read/write against the claims table so expired entries never leak.
+    fn prune_expired_claims(&mut self, now: u64) {
+        self.claims.retain(|_, c| c.ttl_unix_secs > now);
     }
 }
 
@@ -378,6 +388,117 @@ where
                 now.saturating_sub(rec.last_heartbeat_unix_secs) <= timeout_secs
             });
             let snapshot: Vec<PeerRecord> = st.peers.values().cloned().collect();
+            drop(st);
+            let value = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+            write_json_line(write_half, &Reply::ok_with(value)).await?;
+        }
+        ClientMessage::ClaimAcquire {
+            path,
+            ttl_unix_secs,
+            reason,
+            force,
+        } => {
+            let now = now_unix_secs();
+            let mut st = state.lock().await;
+            st.prune_expired_claims(now);
+            // Conflict iff path is held by a different session AND not forcing.
+            let existing = st.claims.get(&path).cloned();
+            let conflict = match &existing {
+                Some(c) if c.session_id != sid && !force => Some(c.clone()),
+                _ => None,
+            };
+            if let Some(c) = conflict {
+                drop(st);
+                let detail = serde_json::json!({
+                    "holder": c.session_id,
+                    "expires_unix": c.ttl_unix_secs,
+                    "reason": c.reason,
+                });
+                let reply = Reply {
+                    ok: false,
+                    error: Some("claim_conflict".into()),
+                    data: Some(detail),
+                };
+                write_json_line(write_half, &reply).await?;
+                return Ok(());
+            }
+            // If force-evicting a foreign holder, publish their release first.
+            if let Some(prev) = existing {
+                if prev.session_id != sid {
+                    let _ = bcast.send(BroadcastMsg {
+                        topic: "claim.release".into(),
+                        data: serde_json::json!({
+                            "path": prev.path,
+                            "session_id": prev.session_id,
+                        }),
+                        from: sid.clone(),
+                    });
+                }
+            }
+            let rec = ClaimRecord {
+                path: path.clone(),
+                session_id: sid.clone(),
+                ttl_unix_secs,
+                acquired_unix_secs: now,
+                reason: reason.clone(),
+            };
+            st.claims.insert(path.clone(), rec);
+            // Heartbeat-touch since we used the bus.
+            if let Some(p) = st.peers.get_mut(&sid) {
+                p.last_heartbeat_unix_secs = now;
+            }
+            drop(st);
+            let _ = bcast.send(BroadcastMsg {
+                topic: "claim.acquire".into(),
+                data: serde_json::json!({
+                    "path": path,
+                    "session_id": sid,
+                    "ttl_unix_secs": ttl_unix_secs,
+                    "reason": reason,
+                }),
+                from: sid.clone(),
+            });
+            let payload = serde_json::json!({
+                "path": path,
+                "ttl_unix_secs": ttl_unix_secs,
+            });
+            write_json_line(write_half, &Reply::ok_with(payload)).await?;
+        }
+        ClientMessage::ClaimRelease { path } => {
+            let now = now_unix_secs();
+            let mut st = state.lock().await;
+            st.prune_expired_claims(now);
+            // Only release if held by this same session. Other sessions'
+            // claims are not affected by a release call from us.
+            let released = match st.claims.get(&path) {
+                Some(c) if c.session_id == sid => {
+                    st.claims.remove(&path);
+                    true
+                }
+                _ => false,
+            };
+            if let Some(p) = st.peers.get_mut(&sid) {
+                p.last_heartbeat_unix_secs = now;
+            }
+            drop(st);
+            if released {
+                let _ = bcast.send(BroadcastMsg {
+                    topic: "claim.release".into(),
+                    data: serde_json::json!({
+                        "path": path,
+                        "session_id": sid,
+                    }),
+                    from: sid.clone(),
+                });
+            }
+            let payload = serde_json::json!({"released": released});
+            write_json_line(write_half, &Reply::ok_with(payload)).await?;
+        }
+        ClientMessage::ClaimList {} => {
+            let now = now_unix_secs();
+            let mut st = state.lock().await;
+            st.prune_expired_claims(now);
+            let snapshot: Vec<ClaimRecord> = st.claims.values().cloned().collect();
             drop(st);
             let value = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
             write_json_line(write_half, &Reply::ok_with(value)).await?;

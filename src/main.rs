@@ -30,6 +30,7 @@
 use agorabus::{
     Client, ClientMessage, DaemonConfig, default_socket_path, protocol::ServerEvent, run_daemon,
 };
+use tokio::time::{Instant, timeout};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -112,6 +113,56 @@ enum Command {
         /// Last tool name to record.
         #[arg(long, default_value = "")]
         tool: String,
+    },
+    /// Advisory soft-locks on filesystem paths (PRD-chord-claim).
+    #[command(subcommand)]
+    Claim(ClaimCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum ClaimCommand {
+    /// Acquire an advisory claim on a path.
+    Acquire {
+        /// Session id to record as the holder.
+        #[arg(long)]
+        session_id: String,
+        /// Path to claim. Canonicalized to an absolute path before send.
+        path: String,
+        /// Time-to-live in seconds from now.
+        #[arg(long, default_value_t = 600)]
+        ttl: u64,
+        /// Human-readable rationale shown in `claim list`.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Overwrite any conflicting claim from a different session.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Client-side wait: if a conflict is hit, subscribe to
+        /// `claim.release` and retry up to `wait` seconds.
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+    },
+    /// Release the claim this session holds on a path. Idempotent.
+    Release {
+        /// Session id that owns the claim.
+        #[arg(long)]
+        session_id: String,
+        /// Path to release. Canonicalized to an absolute path before send.
+        path: String,
+    },
+    /// Print the active-claims snapshot as JSON. Fail-open: `[]` and exit 0
+    /// when no daemon is reachable.
+    List {
+        /// Filter to a specific path (canonicalized).
+        #[arg(long)]
+        path: Option<String>,
+        /// Filter to a specific session.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Output shape: `text` (one record per line) or `json` (single JSON
+        /// array). Default: `json`.
+        #[arg(long, default_value = "json")]
+        format: String,
     },
 }
 
@@ -298,6 +349,7 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             let _ = std::any::TypeId::of::<ServerEvent>();
             Ok(ExitCode::SUCCESS)
         }
+        Command::Claim(sub) => run_claim(sub, &socket).await,
         Command::Heartbeat { session_id, tool } => {
             let Some(mut client) = Client::try_connect(&socket).await? else {
                 return Ok(ExitCode::SUCCESS);
@@ -319,6 +371,200 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             } else {
                 ExitCode::from(1)
             })
+        }
+    }
+}
+
+fn canonicalize_input(path: &str) -> PathBuf {
+    let p = PathBuf::from(path);
+    let absolute = if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().map_or_else(|_| p.clone(), |cwd| cwd.join(&p))
+    };
+    // `std::fs::canonicalize` requires the path to exist; for not-yet-created
+    // files (a common case: claim a path you're about to write) we fall back
+    // to canonicalizing the parent and re-joining the file name.
+    std::fs::canonicalize(&absolute).unwrap_or_else(|_| {
+        absolute
+            .parent()
+            .and_then(|parent| {
+                std::fs::canonicalize(parent).ok().and_then(|canon_parent| {
+                    absolute
+                        .file_name()
+                        .map(|name| canon_parent.join(name))
+                })
+            })
+            .unwrap_or(absolute)
+    })
+}
+
+fn now_unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+async fn run_claim(sub: ClaimCommand, socket: &PathBuf) -> Result<ExitCode> {
+    match sub {
+        ClaimCommand::Acquire {
+            session_id,
+            path,
+            ttl,
+            reason,
+            force,
+            wait,
+        } => {
+            let canon = canonicalize_input(&path);
+            let canon_str = canon.to_string_lossy().into_owned();
+            let Some(mut client) = Client::try_connect(socket).await? else {
+                return Ok(ExitCode::SUCCESS);
+            };
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_default();
+            let _ = client
+                .announce(&session_id, std::process::id(), &cwd, "claim-client")
+                .await?;
+            let ttl_unix = now_unix_secs().saturating_add(ttl);
+            let mut reply = client
+                .claim_acquire(&canon_str, ttl_unix, &reason, force)
+                .await?;
+            if !reply.ok
+                && reply.error.as_deref() == Some("claim_conflict")
+                && wait > 0
+            {
+                // Client-side wait: open a fresh subscriber connection,
+                // listen for claim.release on this exact path, then retry.
+                let deadline = Instant::now() + Duration::from_secs(wait);
+                let mut sub_client = Client::connect(socket).await?;
+                let sub_sid = format!("{session_id}-wait");
+                let _ = sub_client
+                    .announce(&sub_sid, std::process::id(), &cwd, "claim-wait")
+                    .await?;
+                let _ = sub_client.subscribe("claim.release").await?;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        // Annotate the conflict reply with timed_out=true so
+                        // callers can distinguish "tried-and-failed" from
+                        // "rejected-without-waiting".
+                        if let Some(serde_json::Value::Object(ref mut m)) = reply.data {
+                            m.insert("timed_out".into(), serde_json::Value::Bool(true));
+                        }
+                        break;
+                    }
+                    match timeout(remaining, sub_client.next_event()).await {
+                        Ok(Ok(Some(ev))) => {
+                            if ev.topic == "claim.release" {
+                                if let Some(p) = ev.data.get("path").and_then(|v| v.as_str()) {
+                                    if p == canon_str {
+                                        // Retry acquire.
+                                        let ttl_unix2 =
+                                            now_unix_secs().saturating_add(ttl);
+                                        reply = client
+                                            .claim_acquire(
+                                                &canon_str, ttl_unix2, &reason, force,
+                                            )
+                                            .await?;
+                                        if reply.ok
+                                            || reply.error.as_deref()
+                                                != Some("claim_conflict")
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Ok(None)) | Ok(Err(_)) => break,
+                        Err(_) => {
+                            // Deadline hit before a usable claim.release
+                            // arrived. Annotate the conflict reply so callers
+                            // can distinguish a timed-out wait from an
+                            // immediate-reject (no --wait at all).
+                            if let Some(serde_json::Value::Object(ref mut m)) = reply.data {
+                                m.insert("timed_out".into(), serde_json::Value::Bool(true));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            println!("{}", serde_json::to_string(&reply)?);
+            Ok(if reply.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        ClaimCommand::Release { session_id, path } => {
+            let canon = canonicalize_input(&path);
+            let canon_str = canon.to_string_lossy().into_owned();
+            let Some(mut client) = Client::try_connect(socket).await? else {
+                return Ok(ExitCode::SUCCESS);
+            };
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_default();
+            let _ = client
+                .announce(&session_id, std::process::id(), &cwd, "claim-client")
+                .await?;
+            let reply = client.claim_release(&canon_str).await?;
+            println!("{}", serde_json::to_string(&reply)?);
+            Ok(if reply.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        ClaimCommand::List {
+            path,
+            session_id,
+            format,
+        } => {
+            let Some(mut client) = Client::try_connect(socket).await? else {
+                println!("[]");
+                return Ok(ExitCode::SUCCESS);
+            };
+            let cli_pid = std::process::id();
+            let sid = format!("cli-claim-list-{cli_pid}");
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_default();
+            let _ = client.announce(&sid, cli_pid, &cwd, "claim-list-query").await?;
+            let mut claims = client.claim_list().await?;
+            if let Some(want_path) = path {
+                let canon = canonicalize_input(&want_path)
+                    .to_string_lossy()
+                    .into_owned();
+                claims.retain(|c| c.path == canon);
+            }
+            if let Some(want_sid) = session_id {
+                claims.retain(|c| c.session_id == want_sid);
+            }
+            match format.as_str() {
+                "text" => {
+                    for c in &claims {
+                        println!(
+                            "{}\t{}\tttl_unix={}\tacquired_unix={}\treason={}",
+                            c.path,
+                            c.session_id,
+                            c.ttl_unix_secs,
+                            c.acquired_unix_secs,
+                            c.reason
+                        );
+                    }
+                }
+                _ => {
+                    println!("{}", serde_json::to_string(&claims)?);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
         }
     }
 }

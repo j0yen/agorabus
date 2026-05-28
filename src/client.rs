@@ -10,7 +10,7 @@
     clippy::future_not_send,
 )]
 
-use crate::protocol::{ClientMessage, PeerRecord, Reply, ServerEvent};
+use crate::protocol::{ClaimRecord, ClientMessage, PeerRecord, Reply, ServerEvent};
 use anyhow::{Context as _, Result, anyhow};
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -176,6 +176,59 @@ impl Client {
             data,
         })
         .await
+    }
+
+    /// Acquire an advisory claim on `path` (already canonicalized).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Self::request`].
+    pub async fn claim_acquire(
+        &mut self,
+        path: &str,
+        ttl_unix_secs: u64,
+        reason: &str,
+        force: bool,
+    ) -> Result<Reply> {
+        self.request(&ClientMessage::ClaimAcquire {
+            path: path.to_string(),
+            ttl_unix_secs,
+            reason: reason.to_string(),
+            force,
+        })
+        .await
+    }
+
+    /// Release the claim this session holds on `path`. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Self::request`].
+    pub async fn claim_release(&mut self, path: &str) -> Result<Reply> {
+        self.request(&ClientMessage::ClaimRelease {
+            path: path.to_string(),
+        })
+        .await
+    }
+
+    /// Snapshot of all currently-active claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on I/O failure or if the reply payload does not decode
+    /// as a claim list.
+    pub async fn claim_list(&mut self) -> Result<Vec<ClaimRecord>> {
+        let reply = self.request(&ClientMessage::ClaimList {}).await?;
+        if !reply.ok {
+            return Err(anyhow!(
+                "claim_list query failed: {}",
+                reply.error.unwrap_or_else(|| "(no error tag)".into())
+            ));
+        }
+        let data = reply.data.unwrap_or(serde_json::Value::Array(vec![]));
+        let claims: Vec<ClaimRecord> =
+            serde_json::from_value(data).context("decoding claim_list payload")?;
+        Ok(claims)
     }
 
     /// Subscribe to a prefix. The initial Reply is returned, after which

@@ -12,7 +12,7 @@ pub mod protocol;
 
 pub use client::Client;
 pub use daemon::{DaemonConfig, run_daemon};
-pub use protocol::{ClientMessage, PeerRecord, Reply, ServerEvent};
+pub use protocol::{ClaimRecord, ClientMessage, PeerRecord, Reply, ServerEvent};
 
 use std::path::PathBuf;
 
