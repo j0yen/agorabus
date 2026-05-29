@@ -9,10 +9,12 @@
 pub mod client;
 pub mod daemon;
 pub mod protocol;
+pub mod reconnect;
 
 pub use client::Client;
 pub use daemon::{DaemonConfig, run_daemon};
 pub use protocol::{ClaimRecord, ClientMessage, PeerRecord, Reply, ServerEvent};
+pub use reconnect::{ReconnectConfig, backoff_delay, reconnect_subscribe};
 
 use std::path::PathBuf;
 

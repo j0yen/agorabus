@@ -28,7 +28,8 @@
 )]
 
 use agorabus::{
-    Client, ClientMessage, DaemonConfig, default_socket_path, protocol::ServerEvent, run_daemon,
+    Client, ClientMessage, DaemonConfig, ReconnectConfig, default_socket_path,
+    protocol::ServerEvent, reconnect_subscribe, run_daemon,
 };
 use tokio::time::{Instant, timeout};
 use anyhow::Result;
@@ -93,7 +94,8 @@ enum Command {
         data: String,
     },
     /// Subscribe to a topic prefix. Streams one JSON line per event to
-    /// stdout until EOF or `--max-events`.
+    /// stdout until EOF or `--max-events`. Reconnects automatically on
+    /// daemon restart; use `--no-reconnect` for one-shot / scripted callers.
     Subscribe {
         /// Session id used at announce time.
         #[arg(long, default_value = "cli-subscriber")]
@@ -103,6 +105,19 @@ enum Command {
         /// Cap on events to receive before exiting (0 = unlimited).
         #[arg(long, default_value_t = 0)]
         max_events: usize,
+        /// Disable reconnect on EOF/connection-reset (old exit-on-EOF behaviour).
+        #[arg(long, default_value_t = false)]
+        no_reconnect: bool,
+        /// Base delay in milliseconds for exponential backoff on reconnect.
+        #[arg(long, default_value_t = 100)]
+        reconnect_base_ms: u64,
+        /// Maximum delay cap in milliseconds for reconnect backoff.
+        #[arg(long, default_value_t = 5_000)]
+        reconnect_cap_ms: u64,
+        /// Maximum number of reconnect attempts before exiting non-zero
+        /// (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
+        max_reconnect_attempts: usize,
     },
     /// Send a single heartbeat on a new connection. Use --tool to record
     /// the most-recently-invoked tool name.
@@ -320,66 +335,53 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             session_id,
             prefix,
             max_events,
+            no_reconnect,
+            reconnect_base_ms,
+            reconnect_cap_ms,
+            max_reconnect_attempts,
         } => {
-            let Some(mut client) = Client::try_connect(&socket).await? else {
-                return Ok(ExitCode::SUCCESS);
-            };
             let cwd = std::env::current_dir()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_default();
-            let _ = client
-                .announce(&session_id, std::process::id(), &cwd, "subscriber")
-                .await?;
-            let _ = client.subscribe(&prefix).await?;
-            let (mut write_half, mut reader) = client.into_halves();
-
-            // Keep `last_heartbeat_unix_secs` fresh so the daemon's
-            // peers-query prune (default 60s) doesn't drop a live
-            // subscriber. Tick at half the default timeout.
-            let heartbeat_handle = tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(
-                    agorabus::DEFAULT_HEARTBEAT_TIMEOUT_SECS / 2,
-                ));
-                ticker.tick().await; // discard the immediate first tick
-                loop {
-                    ticker.tick().await;
-                    if agorabus::client::send_heartbeat(&mut write_half, "")
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            });
-
-            let mut received = 0_usize;
-            loop {
-                let Some(line) = reader.next_line().await? else {
-                    break;
-                };
-                let parsed: agorabus::client::InboundLine =
-                    match serde_json::from_str(&line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                match parsed {
-                    agorabus::client::InboundLine::Reply(_) => continue,
-                    agorabus::client::InboundLine::Event(ev) => {
-                        println!("{}", serde_json::to_string(&ev)?);
-                        received = received.saturating_add(1);
-                        if max_events != 0 && received >= max_events {
-                            break;
-                        }
-                    }
-                }
-            }
-            heartbeat_handle.abort();
-            let _ = heartbeat_handle.await;
+            let pid = std::process::id();
+            let cfg = ReconnectConfig {
+                base_ms: reconnect_base_ms,
+                cap_ms: reconnect_cap_ms,
+                max_attempts: max_reconnect_attempts,
+            };
             // Silence unused-must-use for the borrow of ServerEvent (lint
             // checker hint; not a real warning).
             let _ = std::any::TypeId::of::<ServerEvent>();
-            Ok(ExitCode::SUCCESS)
+            let result = reconnect_subscribe(
+                &socket,
+                &session_id,
+                pid,
+                &cwd,
+                "subscriber",
+                &prefix,
+                max_events,
+                !no_reconnect,
+                cfg,
+                |ev| {
+                    // on_event: print the event as ndjson + signal continue.
+                    match serde_json::to_string(&ev) {
+                        Ok(line) => {
+                            println!("{line}");
+                            true
+                        }
+                        Err(_) => true,
+                    }
+                },
+            )
+            .await;
+            match result {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(e) => {
+                    eprintln!("agorabus subscribe: {e:#}");
+                    Ok(ExitCode::from(1))
+                }
+            }
         }
         Command::Claim(sub) => run_claim(sub, &socket).await,
         Command::Intent(sub) => run_intent(sub, &socket).await,
