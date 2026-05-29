@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.0 — 2026-05-29
+
+Fix multi-prefix subscribe: the daemon's per-connection state held a single
+`subscribed_prefix: Option<String>` slot, so each `Subscribe` op overwrote the
+prior prefix and only the last `subscribe()` call took effect. Changed to a
+`Vec<String>` that appends on each `Subscribe`, with `topic_matches` now
+"any prefix matches". Single-subscribe clients are unaffected; multi-prefix
+clients (wm-audio `["wm.tts.","wm.dialog.","wm.audio.reload"]`, wm-dialog
+`["wm.audio.","wm.stt.","wm.brain."]`) now receive events on all their
+prefixes instead of just the last one. Semver minor — behaviour change.
+
 ## v0.3.0 — 2026-05-28
 
 Extend the heartbeat envelope with three optional, sticky structured-intent

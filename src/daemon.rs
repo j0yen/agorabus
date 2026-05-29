@@ -181,7 +181,7 @@ async fn handle_connection(
     let mut reader = BufReader::new(read_half).lines();
 
     let mut session_id: Option<String> = None;
-    let mut subscribed_prefix: Option<String> = None;
+    let mut subscribed_prefixes: Vec<String> = Vec::new();
     let mut bcast_rx: Option<broadcast::Receiver<BroadcastMsg>> = None;
 
     loop {
@@ -194,7 +194,7 @@ async fn handle_connection(
                             handle_line(
                                 &l,
                                 &mut session_id,
-                                &mut subscribed_prefix,
+                                &mut subscribed_prefixes,
                                 &mut bcast_rx,
                                 &state,
                                 &bcast,
@@ -209,8 +209,7 @@ async fn handle_connection(
                 ev = rx.recv() => {
                     match ev {
                         Ok(msg) => {
-                            let prefix = subscribed_prefix.clone().unwrap_or_default();
-                            if topic_matches(&prefix, &msg.topic) {
+                            if topic_matches(&subscribed_prefixes, &msg.topic) {
                                 let event = ServerEvent { topic: msg.topic, data: msg.data, from: msg.from };
                                 write_json_line(&mut write_half, &event).await?;
                             }
@@ -229,7 +228,7 @@ async fn handle_connection(
                     handle_line(
                         &line,
                         &mut session_id,
-                        &mut subscribed_prefix,
+                        &mut subscribed_prefixes,
                         &mut bcast_rx,
                         &state,
                         &bcast,
@@ -262,7 +261,7 @@ async fn handle_connection(
 async fn handle_line<W>(
     line: &str,
     session_id: &mut Option<String>,
-    subscribed_prefix: &mut Option<String>,
+    subscribed_prefixes: &mut Vec<String>,
     bcast_rx: &mut Option<broadcast::Receiver<BroadcastMsg>>,
     state: &Arc<Mutex<BusState>>,
     bcast: &broadcast::Sender<BroadcastMsg>,
@@ -398,8 +397,18 @@ where
             write_json_line(write_half, &Reply::ok()).await?;
         }
         ClientMessage::Subscribe { prefix } => {
-            *subscribed_prefix = Some(prefix);
-            *bcast_rx = Some(bcast.subscribe());
+            // Append on each Subscribe so multiple subscribe() calls accumulate
+            // prefixes (pre-0.4 this slot held a single Option and the last
+            // Subscribe silently overwrote all prior ones). Dedup to keep the
+            // match cheap; first Subscribe also wires up the broadcast receiver,
+            // and later ones must not replace it (that would reset the channel
+            // position and drop in-flight events).
+            if !subscribed_prefixes.contains(&prefix) {
+                subscribed_prefixes.push(prefix);
+            }
+            if bcast_rx.is_none() {
+                *bcast_rx = Some(bcast.subscribe());
+            }
             write_json_line(write_half, &Reply::ok()).await?;
         }
         ClientMessage::Peers {} => {
@@ -542,11 +551,13 @@ where
     Ok(())
 }
 
-fn topic_matches(prefix: &str, topic: &str) -> bool {
-    if prefix.is_empty() {
+fn topic_matches(prefixes: &[String], topic: &str) -> bool {
+    // No prefixes registered, or any empty-string prefix, means "match all"
+    // (preserves the pre-0.4 `unwrap_or_default()` + empty-prefix semantics).
+    if prefixes.is_empty() {
         return true;
     }
-    topic.starts_with(prefix)
+    prefixes.iter().any(|p| p.is_empty() || topic.starts_with(p))
 }
 
 fn now_unix_secs() -> u64 {
