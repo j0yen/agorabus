@@ -19,6 +19,8 @@
     clippy::missing_errors_doc,
     clippy::too_many_arguments,
     clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    clippy::print_stderr,
 )]
 
 use std::path::Path;
@@ -250,7 +252,7 @@ where
 
             // If we stayed connected long enough (≥ cap_ms), reset attempt
             // exponent so a flapping daemon doesn't escalate backoff forever.
-            let survived_ms = connected_at.elapsed().as_millis() as u64;
+            let survived_ms = u64::try_from(connected_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             if survived_ms >= cfg.cap_ms {
                 attempt = 0;
             }
