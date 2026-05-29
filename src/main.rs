@@ -28,7 +28,10 @@
 )]
 
 use agorabus::{
-    Client, ClientMessage, DaemonConfig, default_socket_path, protocol::ServerEvent, run_daemon,
+    Client, ClientMessage, DaemonConfig, default_socket_path,
+    doctor::{DoctorFormat, print_report, run_doctor},
+    protocol::ServerEvent,
+    run_daemon,
 };
 use tokio::time::{Instant, timeout};
 use anyhow::Result;
@@ -121,6 +124,17 @@ enum Command {
     /// (PRD-chord-intent-rich).
     #[command(subcommand)]
     Intent(IntentCommand),
+    /// Check whether the running daemon binary is current or stale.
+    ///
+    /// Introspects `/proc/<daemon-pid>/exe`: detects `(deleted)` suffix,
+    /// compares running vs on-disk inodes, and reports a verdict.
+    ///
+    /// Exit codes: 0 = current, 1 = stale, 2 = unknown (no daemon / unreadable).
+    Doctor {
+        /// Output format: `text` (default, human-readable) or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -380,6 +394,15 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             // checker hint; not a real warning).
             let _ = std::any::TypeId::of::<ServerEvent>();
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Doctor { format } => {
+            let fmt = DoctorFormat::parse(&format).unwrap_or_else(|| {
+                eprintln!("agorabus doctor: unknown format {format:?}; using text");
+                DoctorFormat::Text
+            });
+            let (report, code) = run_doctor(None);
+            print_report(&report, fmt);
+            Ok(code)
         }
         Command::Claim(sub) => run_claim(sub, &socket).await,
         Command::Intent(sub) => run_intent(sub, &socket).await,

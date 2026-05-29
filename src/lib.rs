@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod daemon;
+pub mod doctor;
 pub mod protocol;
 
 pub use client::Client;

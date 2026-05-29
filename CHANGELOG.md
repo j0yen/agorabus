@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.0 — 2026-05-29
+
+Add `agorabus doctor` subcommand: self-staleness detection for the running
+agorabus daemon. The subcommand introspects `/proc/<daemon-pid>/exe`, detects
+the ` (deleted)` suffix (binary replaced underneath the running process),
+compares running vs on-disk inodes, and reads the optional `user.prov.ts`
+xattr. Verdict output: `current` (exit 0), `stale: deleted-exe` or
+`stale: inode-drift` (exit 1), `unknown` / no daemon (exit 2).
+Supports `--format text` (default, human-readable) and `--format json`
+(`{daemon_pid, exe_path, exe_inode, ondisk_inode, prov_ts, verdict}`).
+Daemon pid discovery is self-contained (proc scan; no binstale dependency).
+All existing subcommands unaffected. New `src/doctor.rs` module exposed
+via `agorabus::doctor`.
+
 ## v0.4.0 — 2026-05-29
 
 Fix multi-prefix subscribe: the daemon's per-connection state held a single
