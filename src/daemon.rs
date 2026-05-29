@@ -215,8 +215,7 @@ async fn handle_connection(
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Lagged: best effort; continue.
-                            continue;
+                            // Lagged: best effort; fall through to next iteration.
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
@@ -257,7 +256,11 @@ async fn handle_connection(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+// Cognitive complexity is high by design — this is the single-entry message
+// router that dispatches every `ClientMessage` variant. Splitting it per-
+// variant would hide the announce-first invariant and obscure the shared
+// state borrow ordering. Audit changes here carefully.
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 async fn handle_line<W>(
     line: &str,
     session_id: &mut Option<String>,

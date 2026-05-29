@@ -17,10 +17,11 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-/// A line received from the daemon on a subscribed connection: either a
-/// streaming broadcast [`ServerEvent`] or a one-shot [`Reply`] to a request
-/// the client sent (e.g. a periodic heartbeat). Long-lived subscribe loops
-/// use this to demultiplex the two on the same wire.
+/// A line received from the daemon on a subscribed connection.
+///
+/// Either a streaming broadcast [`ServerEvent`] or a one-shot [`Reply`] to
+/// a request the client sent (e.g. a periodic heartbeat). Long-lived
+/// subscribe loops use this to demultiplex the two on the same wire.
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 pub enum InboundLine {
@@ -30,8 +31,9 @@ pub enum InboundLine {
     Reply(Reply),
 }
 
-/// Send a single [`ClientMessage::Heartbeat`] over a raw write half. Used
-/// by long-lived subscribe loops to refresh the daemon's
+/// Send a single [`ClientMessage::Heartbeat`] over a raw write half.
+///
+/// Used by long-lived subscribe loops to refresh the daemon's
 /// `last_heartbeat_unix_secs` without a reply read (the reply is consumed
 /// out-of-band by [`Client::next_event`], which skips [`InboundLine::Reply`]).
 ///
@@ -289,7 +291,7 @@ impl Client {
                         .context("decoding inbound line")?;
                     match parsed {
                         InboundLine::Event(ev) => return Ok(Some(ev)),
-                        InboundLine::Reply(_) => continue,
+                        InboundLine::Reply(_) => {}
                     }
                 }
                 None => return Ok(None),
@@ -300,7 +302,6 @@ impl Client {
     /// Consume the client and return the raw `(write_half, line_reader)`
     /// halves. Useful for subscribe loops that want to interleave reads
     /// with a periodic heartbeat task running on a separate tokio task.
-    #[must_use]
     pub fn into_halves(self) -> (OwnedWriteHalf, tokio::io::Lines<BufReader<OwnedReadHalf>>) {
         (self.write, self.reader)
     }
