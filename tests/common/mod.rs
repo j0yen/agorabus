@@ -43,6 +43,36 @@ impl DaemonHandle {
         Self::start_with_timeout(Duration::from_secs(60)).await
     }
 
+    /// Stop the running daemon (drops the listener / closes peer sockets) but
+    /// keep the `tmp` dir and socket *path* alive so a fresh daemon can be
+    /// bound on the same path. Models a daemon bounce for reconnect tests.
+    pub async fn stop_only(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(j) = self.join.take() {
+            let _ = j.await;
+        }
+    }
+
+    /// Relaunch a fresh daemon on the *same* socket path as a prior
+    /// `stop_only`. The daemon removes the stale socket file on bind. Must be
+    /// called after `stop_only`; reuses `self.socket` / `self.tmp`.
+    pub async fn restart_with_timeout(&mut self, heartbeat_timeout: Duration) {
+        let cfg = DaemonConfig {
+            socket_path: self.socket.clone(),
+            heartbeat_timeout,
+            broadcast_capacity: 256,
+        };
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let join =
+            tokio::spawn(async move { run_daemon(cfg, Some(ready_tx), shutdown_rx).await });
+        ready_rx.await.expect("daemon ready after restart");
+        self.shutdown = Some(shutdown_tx);
+        self.join = Some(join);
+    }
+
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());

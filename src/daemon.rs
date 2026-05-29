@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
+use tokio::task::JoinSet;
 
 /// Daemon configuration.
 #[derive(Debug, Clone)]
@@ -139,20 +140,34 @@ pub async fn run_daemon(
     let (bcast_tx, _) = broadcast::channel::<BroadcastMsg>(config.broadcast_capacity);
     let heartbeat_timeout = config.heartbeat_timeout;
     let conn_counter = AtomicU64::new(0);
+    // Track per-connection tasks so we can abort them on shutdown, ensuring
+    // that subscriber UnixStreams are closed and clients receive EOF promptly.
+    let mut conn_tasks: JoinSet<()> = JoinSet::new();
 
     loop {
         tokio::select! {
             _ = &mut shutdown => {
                 let _ = tokio::fs::remove_file(socket_path).await;
+                // Abort all live connection tasks so their UnixStreams are
+                // dropped. Without this, subscriber tasks block in
+                // `reader.next_line()` indefinitely — they never see EOF and
+                // never trigger reconnect logic.
+                conn_tasks.abort_all();
+                // Give tasks a brief moment to actually drop (not required for
+                // correctness, but avoids spurious address-already-in-use
+                // races when the daemon bounces on the same socket path).
+                while conn_tasks.join_next().await.is_some() {}
                 return Ok(());
             }
+            // Reap finished connection tasks to avoid unbounded growth.
+            Some(_) = conn_tasks.join_next() => {}
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _addr)) => {
                         let state = Arc::clone(&state);
                         let bcast = bcast_tx.clone();
                         let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
-                        tokio::spawn(async move {
+                        conn_tasks.spawn(async move {
                             if let Err(e) = handle_connection(stream, state, bcast, heartbeat_timeout, conn_id).await {
                                 // Per-connection errors are noisy in normal operation
                                 // (clients disconnect). Drop without polluting stdout/stderr.
