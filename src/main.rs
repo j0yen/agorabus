@@ -28,7 +28,10 @@
 )]
 
 use agorabus::{
-    Client, ClientMessage, DaemonConfig, default_socket_path, protocol::ServerEvent, run_daemon,
+    Client, ClientMessage, DaemonConfig, default_socket_path,
+    doctor::{DoctorFormat, print_report, run_doctor},
+    protocol::ServerEvent,
+    run_daemon,
 };
 use tokio::time::{Instant, timeout};
 use anyhow::Result;
@@ -121,6 +124,18 @@ enum Command {
     /// (PRD-chord-intent-rich).
     #[command(subcommand)]
     Intent(IntentCommand),
+    /// Self-staleness check: compare the running daemon's executing image
+    /// against the installed binary on disk. Exits 0=current, 1=stale,
+    /// 2=unknown (no daemon / unreadable /proc).
+    Doctor {
+        /// Output shape: `text` (single-line verdict) or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Path of the installed binary to compare against. Defaults to
+        /// discovery via `which agorabus` / the current executable.
+        #[arg(long)]
+        installed_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -383,6 +398,19 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
         }
         Command::Claim(sub) => run_claim(sub, &socket).await,
         Command::Intent(sub) => run_intent(sub, &socket).await,
+        Command::Doctor {
+            format,
+            installed_path,
+        } => {
+            let Some(fmt) = DoctorFormat::parse(&format) else {
+                anyhow::bail!("invalid --format {format:?}; expected 'text' or 'json'");
+            };
+            // Pure introspection over /proc + the on-disk binary; no daemon
+            // connection needed (it inspects the daemon, doesn't talk to it).
+            let (report, code) = run_doctor(installed_path.as_deref());
+            print_report(&report, fmt);
+            Ok(code)
+        }
         Command::Heartbeat { session_id, tool } => {
             let Some(mut client) = Client::try_connect(&socket).await? else {
                 return Ok(ExitCode::SUCCESS);
