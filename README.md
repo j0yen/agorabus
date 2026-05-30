@@ -55,6 +55,12 @@ This project was scaffolded from a PRD via the `autobuilder` pipeline. The MUST-
 
 Each AC has a matching integration test under `tests/acceptance_ac<n>.rs`.
 
+## Recent
+
+- **v0.8.0** — `agorabus reload`: one non-destructive command to roll the running bus daemon. Resolves daemon pid, checks binary freshness, snapshots peers, SIGTERMs old daemon, relaunches fresh binary, polls until pre-bounce sessions reconnect, emits structured verdict `{old_pid, new_pid, binary_before, binary_after, peers_before, peers_after, peers_recovered, peers_missing, elapsed_ms, status}`.
+- **v0.7.0** — graceful drain notice on shutdown: SIGTERM/SIGINT broadcasts `{"op":"bus.draining","resume_after_ms":N}` before closing connections.
+- **v0.6.0** — subscriber reconnect: clients survive daemon bounces and re-register the same session_id automatically.
+
 ## Provenance
 
 Built via the [`autobuilder`](https://github.com/j0yen/autobuilder) pipeline (PRD intake -> intent-card -> scaffold -> iterate-and-prove). Originally consolidated as a subdir of the [`wintermute`](https://github.com/j0yen/wintermute) monorepo; this standalone repo is a fresh-init snapshot for easier consumption and distribution.
