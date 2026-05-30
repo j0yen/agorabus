@@ -33,6 +33,7 @@ use agorabus::{
     doctor::{DoctorFormat, print_report, run_doctor},
     protocol::ServerEvent,
     reconnect_subscribe, run_daemon,
+    reload::{ReloadConfig, ReloadFormat, print_verdict, run_reload},
 };
 use tokio::time::{Instant, timeout};
 use anyhow::Result;
@@ -159,6 +160,41 @@ enum Command {
         format: String,
         /// Path of the installed binary to compare against. Defaults to
         /// discovery via `which agorabus` / the current executable.
+        #[arg(long)]
+        installed_path: Option<PathBuf>,
+    },
+    /// Non-destructive one-command daemon bounce: SIGTERM the stale daemon,
+    /// relaunch the fresh binary, then wait for all pre-bounce sessions to
+    /// reconnect. Emits a structured verdict (old_pid, new_pid,
+    /// binary_before/after, peers_before/after/recovered, elapsed_ms, status).
+    ///
+    /// Default posture is `--dry-run`: prints the plan without mutating.
+    Reload {
+        /// Output shape: `text` (human table) or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// If set, skip the reload when the running binary is already current
+        /// (no-op guard). Enabled by default; pass `--no-require-fresh` to
+        /// bypass (e.g. for testing the bounce itself).
+        #[arg(long, default_value_t = true)]
+        require_fresh: bool,
+        /// Start a new daemon even if none is currently running.
+        #[arg(long, default_value_t = false)]
+        start_if_absent: bool,
+        /// Print the plan + freshness verdict + peer set that *would* be
+        /// bounced, without mutating anything. This is the default posture
+        /// (--dry-run true); pass `--no-dry-run` (or `--apply`) to perform
+        /// the actual reload.
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+        /// Milliseconds to wait for the old daemon to exit after SIGTERM.
+        #[arg(long, default_value_t = 2_000)]
+        drain_timeout_ms: u64,
+        /// Milliseconds to wait for pre-bounce sessions to reconnect before
+        /// declaring the reload degraded.
+        #[arg(long, default_value_t = 8_000)]
+        reconnect_timeout_ms: u64,
+        /// Override the installed binary path (for testing / scripts).
         #[arg(long)]
         installed_path: Option<PathBuf>,
     },
@@ -447,6 +483,32 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             } else {
                 ExitCode::from(1)
             })
+        }
+        Command::Reload {
+            format,
+            require_fresh,
+            start_if_absent,
+            dry_run,
+            drain_timeout_ms,
+            reconnect_timeout_ms,
+            installed_path,
+        } => {
+            let Some(fmt) = ReloadFormat::parse(&format) else {
+                anyhow::bail!("invalid --format {format:?}; expected 'text' or 'json'");
+            };
+            let cfg = ReloadConfig {
+                socket_path: socket,
+                require_fresh,
+                start_if_absent,
+                dry_run,
+                drain_timeout_ms,
+                reconnect_timeout_ms,
+                format: fmt,
+                installed_path,
+            };
+            let (verdict, code) = run_reload(&cfg).await?;
+            print_verdict(&verdict, fmt);
+            Ok(code)
         }
     }
 }

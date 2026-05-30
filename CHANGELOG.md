@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.8.0 — 2026-05-29
+
+Add `agorabus reload` subcommand (PRD-agorabus-reload): one non-destructive
+command to roll the running bus daemon. Resolves the daemon pid via `/proc`
+scan, checks binary freshness via the shared `doctor` logic, snapshots the
+pre-bounce peer set, SIGTERMs the old daemon, relaunches the fresh binary via
+`nohup`, then polls until all pre-bounce session_ids have re-registered or
+the reconnect timeout elapses. Emits a structured verdict:
+`{old_pid, new_pid, binary_before, binary_after, peers_before, peers_after,
+peers_recovered, peers_missing, elapsed_ms, status}`. Status is `reloaded`,
+`reloaded-degraded` (some sessions did not reconnect), or `failed`.
+
+Default posture is `--dry-run true` (prints the plan without mutating); use
+`--no-dry-run` / pass `--apply` to perform the actual bounce. Guards:
+`--require-fresh` (default on) refuses to bounce an already-current daemon;
+`--start-if-absent` allows launching a daemon when none is running. New
+`src/reload.rs` module exposed via `agorabus::reload`; five acceptance tests
+in `tests/acceptance_reload_dryrun.rs` cover AC1/AC3/AC4/AC5/AC6.
+
 ## v0.7.0 — 2026-05-29
 
 Add graceful drain notice on shutdown (PRD-agorabus-drain-notice). When

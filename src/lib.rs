@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod protocol;
 pub mod reconnect;
+pub mod reload;
 
 pub use client::Client;
 pub use daemon::{DaemonConfig, run_daemon};
