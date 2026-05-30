@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.7.0 — 2026-05-29
+
+Add graceful drain notice on shutdown (PRD-agorabus-drain-notice). When
+the daemon receives SIGTERM/SIGINT it now broadcasts a
+`{"op":"bus.draining","resume_after_ms":N}` notice to every subscriber
+before closing connections. Subscribers see the advisory hint and can
+pace reconnect attempts (PRD-agorabus-client-reconnect) to avoid a
+thundering-herd on rebind.
+
+New `agorabus daemon` flags: `--drain-grace-ms` (default 200) and
+`--drain-resume-hint-ms` (default 3000). New public API: `DrainNotice`
+struct, `Client::next_raw_line()`, `DEFAULT_DRAIN_GRACE_MS`,
+`DEFAULT_DRAIN_RESUME_HINT_MS`, and two new `DaemonConfig` fields.
+Shutdown remains prompt: drain is best-effort; connections are aborted
+unconditionally after the grace window (stuck subscribers cannot wedge a
+roll). All existing tests pass unchanged (44 total).
+
 ## v0.6.0 — 2026-05-29
 
 Add subscriber reconnect: the long-lived `agorabus subscribe` loop now
