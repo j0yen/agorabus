@@ -19,7 +19,7 @@
     clippy::default_trait_access,
 )]
 
-use crate::protocol::{ClaimRecord, ClientMessage, PeerRecord, Reply, ServerEvent};
+use crate::protocol::{ClaimRecord, ClientMessage, DrainNotice, PeerRecord, Reply, ServerEvent};
 use anyhow::{Context as _, Result};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -44,6 +44,15 @@ pub struct DaemonConfig {
     /// Capacity of the pub/sub broadcast channel. Slow subscribers that lag
     /// past this depth are dropped from that publish (Lagged variant).
     pub broadcast_capacity: usize,
+    /// Grace period given to subscriber writes after the drain notice is sent,
+    /// before the daemon proceeds to exit regardless. Best-effort: a stuck
+    /// subscriber cannot wedge a roll (PRD-agorabus-drain-notice §AC3).
+    /// Default: 200 ms.
+    pub drain_grace_ms: u64,
+    /// Value of `resume_after_ms` embedded in the drain notice. Relayed to
+    /// subscribers as a reconnect backoff hint; the daemon does not compute it.
+    /// Default: 3000 ms.
+    pub drain_resume_hint_ms: u64,
 }
 
 impl DaemonConfig {
@@ -54,6 +63,8 @@ impl DaemonConfig {
             socket_path: crate::default_socket_path(),
             heartbeat_timeout: Duration::from_secs(crate::DEFAULT_HEARTBEAT_TIMEOUT_SECS),
             broadcast_capacity: 1024,
+            drain_grace_ms: crate::DEFAULT_DRAIN_GRACE_MS,
+            drain_resume_hint_ms: crate::DEFAULT_DRAIN_RESUME_HINT_MS,
         }
     }
 }
@@ -138,7 +149,13 @@ pub async fn run_daemon(
 
     let state = Arc::new(Mutex::new(BusState::new()));
     let (bcast_tx, _) = broadcast::channel::<BroadcastMsg>(config.broadcast_capacity);
+    // Drain-notice channel: capacity = 1; each connection task subscribes and
+    // writes the DrainNotice to its socket when a drain fires. Capacity of 16
+    // is more than enough for the subscriber count we target.
+    let (drain_tx, _) = broadcast::channel::<DrainNotice>(16);
     let heartbeat_timeout = config.heartbeat_timeout;
+    let drain_grace_ms = config.drain_grace_ms;
+    let drain_resume_hint_ms = config.drain_resume_hint_ms;
     let conn_counter = AtomicU64::new(0);
     // Track per-connection tasks so we can abort them on shutdown, ensuring
     // that subscriber UnixStreams are closed and clients receive EOF promptly.
@@ -148,6 +165,19 @@ pub async fn run_daemon(
         tokio::select! {
             _ = &mut shutdown => {
                 let _ = tokio::fs::remove_file(socket_path).await;
+
+                // Broadcast the drain notice to every subscribed connection.
+                // Best-effort: if there are no active subscriber receivers the
+                // send returns Err(NoReceivers), which is fine.
+                let notice = DrainNotice::new(drain_resume_hint_ms);
+                let _ = drain_tx.send(notice);
+
+                // Give subscriber tasks a bounded grace period to flush the
+                // drain notice to their sockets before we abort them.
+                // This satisfies AC3: drain must never wedge shutdown — we
+                // abort unconditionally after the grace window.
+                tokio::time::sleep(Duration::from_millis(drain_grace_ms)).await;
+
                 // Abort all live connection tasks so their UnixStreams are
                 // dropped. Without this, subscriber tasks block in
                 // `reader.next_line()` indefinitely — they never see EOF and
@@ -166,9 +196,12 @@ pub async fn run_daemon(
                     Ok((stream, _addr)) => {
                         let state = Arc::clone(&state);
                         let bcast = bcast_tx.clone();
+                        let drain_rx = drain_tx.subscribe();
                         let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
                         conn_tasks.spawn(async move {
-                            if let Err(e) = handle_connection(stream, state, bcast, heartbeat_timeout, conn_id).await {
+                            if let Err(e) = handle_connection(
+                                stream, state, bcast, drain_rx, heartbeat_timeout, conn_id,
+                            ).await {
                                 // Per-connection errors are noisy in normal operation
                                 // (clients disconnect). Drop without polluting stdout/stderr.
                                 let _ = e;
@@ -189,6 +222,7 @@ async fn handle_connection(
     stream: UnixStream,
     state: Arc<Mutex<BusState>>,
     bcast: broadcast::Sender<BroadcastMsg>,
+    mut drain_rx: broadcast::Receiver<DrainNotice>,
     heartbeat_timeout: Duration,
     conn_id: u64,
 ) -> Result<()> {
@@ -200,7 +234,8 @@ async fn handle_connection(
     let mut bcast_rx: Option<broadcast::Receiver<BroadcastMsg>> = None;
 
     loop {
-        // If subscribed, multiplex between client lines and broadcast events.
+        // If subscribed, multiplex between client lines, broadcast events, and
+        // the drain notice channel.
         if let Some(rx) = bcast_rx.as_mut() {
             tokio::select! {
                 line = reader.next_line() => {
@@ -235,24 +270,48 @@ async fn handle_connection(
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
+                drain = drain_rx.recv() => {
+                    // Drain notice: write it to the subscriber best-effort and
+                    // return. The main loop will abort us if we stall, so no
+                    // timeout is needed here — the grace window is enforced
+                    // centrally in `run_daemon` (AC3).
+                    if let Ok(notice) = drain {
+                        // Ignore write errors: the subscriber may have already
+                        // disconnected. The important thing is we attempted the
+                        // send before exit.
+                        let _ = write_json_line(&mut write_half, &notice).await;
+                    }
+                    break;
+                }
             }
         } else {
-            match reader.next_line().await {
-                Ok(Some(line)) => {
-                    handle_line(
-                        &line,
-                        &mut session_id,
-                        &mut subscribed_prefixes,
-                        &mut bcast_rx,
-                        &state,
-                        &bcast,
-                        &mut write_half,
-                        heartbeat_timeout,
-                        conn_id,
-                    )
-                    .await?;
+            tokio::select! {
+                line = reader.next_line() => {
+                    match line {
+                        Ok(Some(line)) => {
+                            handle_line(
+                                &line,
+                                &mut session_id,
+                                &mut subscribed_prefixes,
+                                &mut bcast_rx,
+                                &state,
+                                &bcast,
+                                &mut write_half,
+                                heartbeat_timeout,
+                                conn_id,
+                            )
+                            .await?;
+                        }
+                        Ok(None) | Err(_) => break,
+                    }
                 }
-                Ok(None) | Err(_) => break,
+                drain = drain_rx.recv() => {
+                    // Drain notice on a non-subscribed connection: the client
+                    // is a one-shot (announce/peers/publish). These clients
+                    // complete before shutdown; nothing to send. Just exit.
+                    let _ = drain;
+                    break;
+                }
             }
         }
     }

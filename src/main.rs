@@ -29,6 +29,7 @@
 
 use agorabus::{
     Client, ClientMessage, DaemonConfig, ReconnectConfig, default_socket_path,
+    DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS,
     doctor::{DoctorFormat, print_report, run_doctor},
     protocol::ServerEvent,
     reconnect_subscribe, run_daemon,
@@ -63,6 +64,17 @@ enum Command {
         /// pruned from `peers` results.
         #[arg(long, default_value_t = agorabus::DEFAULT_HEARTBEAT_TIMEOUT_SECS)]
         heartbeat_timeout: u64,
+        /// Grace period in milliseconds: after broadcasting the drain notice on
+        /// SIGTERM/SIGINT, the daemon waits this long for subscriber writes to
+        /// flush before aborting connections and exiting. Must never wedge a
+        /// roll — exit happens unconditionally after the grace window.
+        #[arg(long, default_value_t = DEFAULT_DRAIN_GRACE_MS)]
+        drain_grace_ms: u64,
+        /// Resume hint in milliseconds embedded in the drain notice sent to
+        /// subscribers on shutdown. Subscribers are advised to wait at least
+        /// this long before reconnecting to avoid a thundering-herd on rebind.
+        #[arg(long, default_value_t = DEFAULT_DRAIN_RESUME_HINT_MS)]
+        drain_resume_hint_ms: u64,
     },
     /// One-shot announce + immediate disconnect.
     ///
@@ -253,11 +265,13 @@ fn main() -> ExitCode {
 
 async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
     match cmd {
-        Command::Daemon { heartbeat_timeout } => {
+        Command::Daemon { heartbeat_timeout, drain_grace_ms, drain_resume_hint_ms } => {
             let cfg = DaemonConfig {
                 socket_path: socket,
                 heartbeat_timeout: Duration::from_secs(heartbeat_timeout),
                 broadcast_capacity: 1024,
+                drain_grace_ms,
+                drain_resume_hint_ms,
             };
             let (_ready_tx, _ready_rx) = tokio::sync::oneshot::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-use agorabus::{DaemonConfig, run_daemon};
+use agorabus::{DaemonConfig, DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS, run_daemon};
 
 pub struct DaemonHandle {
     pub socket: PathBuf,
@@ -25,6 +25,8 @@ impl DaemonHandle {
             socket_path: socket.clone(),
             heartbeat_timeout,
             broadcast_capacity: 256,
+            drain_grace_ms: DEFAULT_DRAIN_GRACE_MS,
+            drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
         };
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -41,6 +43,34 @@ impl DaemonHandle {
 
     pub async fn start() -> Self {
         Self::start_with_timeout(Duration::from_secs(60)).await
+    }
+
+    /// Start with custom drain parameters (PRD-agorabus-drain-notice tests).
+    pub async fn start_with_drain(
+        heartbeat_timeout: Duration,
+        drain_grace_ms: u64,
+        drain_resume_hint_ms: u64,
+    ) -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("sock");
+        let cfg = DaemonConfig {
+            socket_path: socket.clone(),
+            heartbeat_timeout,
+            broadcast_capacity: 256,
+            drain_grace_ms,
+            drain_resume_hint_ms,
+        };
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let join =
+            tokio::spawn(async move { run_daemon(cfg, Some(ready_tx), shutdown_rx).await });
+        ready_rx.await.expect("daemon ready");
+        Self {
+            socket,
+            tmp,
+            shutdown: Some(shutdown_tx),
+            join: Some(join),
+        }
     }
 
     /// Stop the running daemon (drops the listener / closes peer sockets) but
@@ -63,6 +93,8 @@ impl DaemonHandle {
             socket_path: self.socket.clone(),
             heartbeat_timeout,
             broadcast_capacity: 256,
+            drain_grace_ms: DEFAULT_DRAIN_GRACE_MS,
+            drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
         };
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

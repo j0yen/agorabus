@@ -14,7 +14,7 @@ pub mod reconnect;
 
 pub use client::Client;
 pub use daemon::{DaemonConfig, run_daemon};
-pub use protocol::{ClaimRecord, ClientMessage, PeerRecord, Reply, ServerEvent};
+pub use protocol::{ClaimRecord, ClientMessage, DrainNotice, PeerRecord, Reply, ServerEvent};
 pub use reconnect::{ReconnectConfig, backoff_delay, reconnect_subscribe};
 
 use std::path::PathBuf;
@@ -35,3 +35,14 @@ pub fn default_socket_path() -> PathBuf {
 
 /// Default heartbeat-timeout in seconds (PRD §4.3).
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 60;
+
+/// Default drain grace period in milliseconds (PRD-agorabus-drain-notice).
+///
+/// After the drain notice is broadcast, the daemon waits at most this long
+/// for subscriber writes to flush before aborting all connections and exiting.
+pub const DEFAULT_DRAIN_GRACE_MS: u64 = 200;
+
+/// Default resume hint in milliseconds embedded in the drain notice
+/// (PRD-agorabus-drain-notice). Subscribers are advised to wait at least
+/// this long before reconnecting to avoid a thundering-herd on rebind.
+pub const DEFAULT_DRAIN_RESUME_HINT_MS: u64 = 3_000;

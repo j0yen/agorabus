@@ -230,3 +230,34 @@ pub struct ServerEvent {
     /// `session_id` of the publishing peer.
     pub from: String,
 }
+
+/// Drain notice sent to every subscriber immediately before the daemon shuts
+/// down (PRD-agorabus-drain-notice).
+///
+/// Wire format: `{"op":"bus.draining","resume_after_ms":<u64>}\n`
+///
+/// This is a distinct JSON shape from [`ServerEvent`] (no `topic`/`data`/`from`
+/// fields) so clients that attempt to deserialize every line as `ServerEvent`
+/// will not silently misinterpret it. A raw-line subscriber treats it as an
+/// advisory notice it may ignore without crashing (AC6).
+///
+/// The `op` field is always `"bus.draining"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainNotice {
+    /// Discriminator — always `"bus.draining"`.
+    pub op: String,
+    /// Suggested delay in milliseconds before reconnecting. The daemon relays
+    /// the value from `--drain-resume-hint-ms` without computing it.
+    pub resume_after_ms: u64,
+}
+
+impl DrainNotice {
+    /// Construct a drain notice with the given resume hint.
+    #[must_use]
+    pub fn new(resume_after_ms: u64) -> Self {
+        Self {
+            op: "bus.draining".to_string(),
+            resume_after_ms,
+        }
+    }
+}

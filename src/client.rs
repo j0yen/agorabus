@@ -299,6 +299,22 @@ impl Client {
         }
     }
 
+    /// Read the next raw line from the daemon without attempting to decode it
+    /// as a specific type. Returns `Ok(None)` on EOF.
+    ///
+    /// Useful when the caller needs to inspect a line that may be a
+    /// [`DrainNotice`] (which has a distinct wire shape from [`ServerEvent`])
+    /// or any other daemon-originated JSON object.
+    ///
+    /// [`DrainNotice`]: crate::protocol::DrainNotice
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on I/O failure.
+    pub async fn next_raw_line(&mut self) -> Option<String> {
+        self.reader.next_line().await.ok().flatten()
+    }
+
     /// Consume the client and return the raw `(write_half, line_reader)`
     /// halves. Useful for subscribe loops that want to interleave reads
     /// with a periodic heartbeat task running on a separate tokio task.
