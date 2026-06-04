@@ -29,8 +29,9 @@
 
 use agorabus::{
     Client, ClientMessage, DaemonConfig, ReconnectConfig, default_socket_path,
-    DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS,
+    DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS, DEFAULT_STATE_FLUSH_MS,
     doctor::{DoctorFormat, print_report, run_doctor},
+    persist::default_state_path,
     protocol::ServerEvent,
     reconnect_subscribe, run_daemon,
     reload::{ReloadConfig, ReloadFormat, print_verdict, run_reload},
@@ -76,6 +77,14 @@ enum Command {
         /// this long before reconnecting to avoid a thundering-herd on rebind.
         #[arg(long, default_value_t = DEFAULT_DRAIN_RESUME_HINT_MS)]
         drain_resume_hint_ms: u64,
+        /// Path for the durable state file (claims + sticky intents).
+        /// Defaults to `~/.cache/agorabus/state.json`.
+        #[arg(long)]
+        state_file: Option<PathBuf>,
+        /// Debounce window in milliseconds for state-flush writes. Bursts of
+        /// mutations within this window are coalesced into a single write.
+        #[arg(long, default_value_t = DEFAULT_STATE_FLUSH_MS)]
+        state_flush_ms: u64,
     },
     /// One-shot announce + immediate disconnect.
     ///
@@ -301,13 +310,15 @@ fn main() -> ExitCode {
 
 async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
     match cmd {
-        Command::Daemon { heartbeat_timeout, drain_grace_ms, drain_resume_hint_ms } => {
+        Command::Daemon { heartbeat_timeout, drain_grace_ms, drain_resume_hint_ms, state_file, state_flush_ms } => {
             let cfg = DaemonConfig {
                 socket_path: socket,
                 heartbeat_timeout: Duration::from_secs(heartbeat_timeout),
                 broadcast_capacity: 1024,
                 drain_grace_ms,
                 drain_resume_hint_ms,
+                state_file: state_file.unwrap_or_else(default_state_path),
+                state_flush_ms,
             };
             let (_ready_tx, _ready_rx) = tokio::sync::oneshot::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

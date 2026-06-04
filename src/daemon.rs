@@ -19,6 +19,7 @@
     clippy::default_trait_access,
 )]
 
+use crate::persist::{DurableState, StickyIntent, default_state_path, load as load_state, save as save_state};
 use crate::protocol::{ClaimRecord, ClientMessage, DrainNotice, PeerRecord, Reply, ServerEvent};
 use anyhow::{Context as _, Result};
 use serde::Serialize;
@@ -53,6 +54,12 @@ pub struct DaemonConfig {
     /// subscribers as a reconnect backoff hint; the daemon does not compute it.
     /// Default: 3000 ms.
     pub drain_resume_hint_ms: u64,
+    /// Path to the durable state file. Defaults to `~/.cache/agorabus/state.json`.
+    /// Overridable via `--state-file` CLI flag.
+    pub state_file: PathBuf,
+    /// Debounce window in milliseconds for state-flush writes. A burst of
+    /// mutations within this window coalesces into a single write. Default: 250 ms.
+    pub state_flush_ms: u64,
 }
 
 impl DaemonConfig {
@@ -65,6 +72,8 @@ impl DaemonConfig {
             broadcast_capacity: 1024,
             drain_grace_ms: crate::DEFAULT_DRAIN_GRACE_MS,
             drain_resume_hint_ms: crate::DEFAULT_DRAIN_RESUME_HINT_MS,
+            state_file: default_state_path(),
+            state_flush_ms: crate::DEFAULT_STATE_FLUSH_MS,
         }
     }
 }
@@ -80,17 +89,23 @@ struct BusState {
     // disconnect. Without this, any one-shot client reusing a long-lived
     // peer's session_id would wipe the long-lived peer's record.
     peer_owners: HashMap<String, u64>,
-    // canonical_path -> active claim. In-memory only; dropped on daemon
-    // restart per PRD-chord-claim §State persistence.
+    // canonical_path -> active claim. Durable: persisted to state.json on
+    // each mutation (PRD-agorabus-state-persist).
     claims: HashMap<String, ClaimRecord>,
+    // session_id -> sticky intent (skill / prd_slug / working_paths).
+    // Durable: persisted alongside claims.
+    intents: HashMap<String, StickyIntent>,
 }
 
 impl BusState {
-    fn new() -> Self {
+    /// Construct from a rehydrated [`DurableState`]. Peers and peer_owners
+    /// start empty — they are populated as peers re-announce after restart.
+    fn from_durable(durable: DurableState) -> Self {
         Self {
             peers: HashMap::new(),
             peer_owners: HashMap::new(),
-            claims: HashMap::new(),
+            claims: durable.claims,
+            intents: durable.intents,
         }
     }
 
@@ -98,6 +113,14 @@ impl BusState {
     // read/write against the claims table so expired entries never leak.
     fn prune_expired_claims(&mut self, now: u64) {
         self.claims.retain(|_, c| c.ttl_unix_secs > now);
+    }
+
+    /// Extract the durable slice for serialization.
+    fn to_durable(&self) -> DurableState {
+        DurableState {
+            claims: self.claims.clone(),
+            intents: self.intents.clone(),
+        }
     }
 }
 
@@ -143,11 +166,47 @@ pub async fn run_daemon(
         .with_context(|| format!("binding UDS at {}", socket_path.display()))?;
     set_mode(socket_path, 0o600)?;
 
+    // Rehydrate durable state from the journal, then prune expired claims.
+    let durable = load_state(&config.state_file).unwrap_or_else(|e| {
+        eprintln!("agorabus: could not read state file: {e:#}; starting empty");
+        DurableState::default()
+    });
+    let mut bus_state = BusState::from_durable(durable);
+    bus_state.prune_expired_claims(now_unix_secs());
+    let state = Arc::new(Mutex::new(bus_state));
+
+    // Persist-flush channel. Connection tasks send () when the durable slice
+    // changes; the persist task debounces and flushes.
+    let (persist_tx, mut persist_rx) = tokio::sync::mpsc::channel::<()>(64);
+    let state_for_persist = Arc::clone(&state);
+    let state_file_for_persist = config.state_file.clone();
+    let flush_debounce = Duration::from_millis(config.state_flush_ms);
+
+    // Spawn the persist writer as a separate task. It drains pending signals
+    // with a debounce window, then writes the current durable state.
+    let persist_task = tokio::spawn(async move {
+        loop {
+            match persist_rx.recv().await {
+                Some(()) => {
+                    // Debounce: drain any additional signals that arrive within
+                    // the flush window, then do a single write.
+                    tokio::time::sleep(flush_debounce).await;
+                    while persist_rx.try_recv().is_ok() {}
+
+                    let durable = state_for_persist.lock().await.to_durable();
+                    if let Err(e) = save_state(&state_file_for_persist, &durable) {
+                        eprintln!("agorabus: state-flush error: {e:#}");
+                    }
+                }
+                None => break, // channel closed → exit
+            }
+        }
+    });
+
     if let Some(tx) = ready_tx {
         let _ = tx.send(());
     }
 
-    let state = Arc::new(Mutex::new(BusState::new()));
     let (bcast_tx, _) = broadcast::channel::<BroadcastMsg>(config.broadcast_capacity);
     // Drain-notice channel: capacity = 1; each connection task subscribes and
     // writes the DrainNotice to its socket when a drain fires. Capacity of 16
@@ -187,6 +246,21 @@ pub async fn run_daemon(
                 // correctness, but avoids spurious address-already-in-use
                 // races when the daemon bounces on the same socket path).
                 while conn_tasks.join_next().await.is_some() {}
+
+                // Final flush: write the current durable state to the journal
+                // before exit, capturing any mutations that arrived after the
+                // last debounced flush.
+                {
+                    let durable = state.lock().await.to_durable();
+                    if let Err(e) = save_state(&config.state_file, &durable) {
+                        eprintln!("agorabus: final state-flush error: {e:#}");
+                    }
+                }
+
+                // Shut down the persist task cleanly.
+                drop(persist_tx);
+                let _ = persist_task.await;
+
                 return Ok(());
             }
             // Reap finished connection tasks to avoid unbounded growth.
@@ -197,10 +271,11 @@ pub async fn run_daemon(
                         let state = Arc::clone(&state);
                         let bcast = bcast_tx.clone();
                         let drain_rx = drain_tx.subscribe();
+                        let persist = persist_tx.clone();
                         let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
                         conn_tasks.spawn(async move {
                             if let Err(e) = handle_connection(
-                                stream, state, bcast, drain_rx, heartbeat_timeout, conn_id,
+                                stream, state, bcast, drain_rx, persist, heartbeat_timeout, conn_id,
                             ).await {
                                 // Per-connection errors are noisy in normal operation
                                 // (clients disconnect). Drop without polluting stdout/stderr.
@@ -223,6 +298,7 @@ async fn handle_connection(
     state: Arc<Mutex<BusState>>,
     bcast: broadcast::Sender<BroadcastMsg>,
     mut drain_rx: broadcast::Receiver<DrainNotice>,
+    persist: tokio::sync::mpsc::Sender<()>,
     heartbeat_timeout: Duration,
     conn_id: u64,
 ) -> Result<()> {
@@ -248,6 +324,7 @@ async fn handle_connection(
                                 &mut bcast_rx,
                                 &state,
                                 &bcast,
+                                &persist,
                                 &mut write_half,
                                 heartbeat_timeout,
                                 conn_id,
@@ -296,6 +373,7 @@ async fn handle_connection(
                                 &mut bcast_rx,
                                 &state,
                                 &bcast,
+                                &persist,
                                 &mut write_half,
                                 heartbeat_timeout,
                                 conn_id,
@@ -342,6 +420,7 @@ async fn handle_line<W>(
     bcast_rx: &mut Option<broadcast::Receiver<BroadcastMsg>>,
     state: &Arc<Mutex<BusState>>,
     bcast: &broadcast::Sender<BroadcastMsg>,
+    persist: &tokio::sync::mpsc::Sender<()>,
     write_half: &mut W,
     heartbeat_timeout: Duration,
     conn_id: u64,
@@ -440,23 +519,51 @@ where
                 write_json_line(write_half, &Reply::error("too_many_paths")).await?;
                 return Ok(());
             }
+            // Track whether the durable intent slice changed so we know
+            // whether to trigger a persist flush.
+            let mut intent_changed = false;
             let mut st = state.lock().await;
             if let Some(rec) = st.peers.get_mut(&sid) {
                 rec.last_heartbeat_unix_secs = now_unix_secs();
                 if !tool.is_empty() {
                     rec.last_tool = tool;
                 }
-                if let Some(s) = skill {
-                    rec.skill = s;
+                if let Some(ref s) = skill {
+                    if rec.skill != *s {
+                        intent_changed = true;
+                    }
+                    rec.skill = s.clone();
                 }
-                if let Some(p) = prd_slug {
-                    rec.prd_slug = p;
+                if let Some(ref p) = prd_slug {
+                    if rec.prd_slug != *p {
+                        intent_changed = true;
+                    }
+                    rec.prd_slug = p.clone();
                 }
-                if let Some(paths) = working_paths {
-                    rec.working_paths = paths;
+                if let Some(ref paths) = working_paths {
+                    if rec.working_paths != *paths {
+                        intent_changed = true;
+                    }
+                    rec.working_paths = paths.clone();
+                }
+                // Update the durable intents map to mirror what's in the peer record.
+                if intent_changed {
+                    let intent = StickyIntent {
+                        skill: rec.skill.clone(),
+                        prd_slug: rec.prd_slug.clone(),
+                        working_paths: rec.working_paths.clone(),
+                    };
+                    if intent.is_empty() {
+                        st.intents.remove(&sid);
+                    } else {
+                        st.intents.insert(sid.clone(), intent);
+                    }
                 }
             }
             drop(st);
+            if intent_changed {
+                let _ = persist.try_send(());
+            }
             write_json_line(write_half, &Reply::ok()).await?;
         }
         ClientMessage::Publish { topic, data } => {
@@ -557,6 +664,8 @@ where
                 p.last_heartbeat_unix_secs = now;
             }
             drop(st);
+            // Signal persist flush: claims changed.
+            let _ = persist.try_send(());
             let _ = bcast.send(BroadcastMsg {
                 topic: "claim.acquire".into(),
                 data: serde_json::json!({
@@ -591,6 +700,8 @@ where
             }
             drop(st);
             if released {
+                // Signal persist flush: claims changed.
+                let _ = persist.try_send(());
                 let _ = bcast.send(BroadcastMsg {
                     topic: "claim.release".into(),
                     data: serde_json::json!({

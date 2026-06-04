@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-use agorabus::{DaemonConfig, DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS, run_daemon};
+use agorabus::{
+    DaemonConfig, DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS, DEFAULT_STATE_FLUSH_MS,
+    run_daemon,
+};
 
 pub struct DaemonHandle {
     pub socket: PathBuf,
@@ -21,12 +24,15 @@ impl DaemonHandle {
     pub async fn start_with_timeout(heartbeat_timeout: Duration) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("sock");
+        let state_file = tmp.path().join("state.json");
         let cfg = DaemonConfig {
             socket_path: socket.clone(),
             heartbeat_timeout,
             broadcast_capacity: 256,
             drain_grace_ms: DEFAULT_DRAIN_GRACE_MS,
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
+            state_file,
+            state_flush_ms: DEFAULT_STATE_FLUSH_MS,
         };
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -53,12 +59,15 @@ impl DaemonHandle {
     ) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("sock");
+        let state_file = tmp.path().join("state.json");
         let cfg = DaemonConfig {
             socket_path: socket.clone(),
             heartbeat_timeout,
             broadcast_capacity: 256,
             drain_grace_ms,
             drain_resume_hint_ms,
+            state_file,
+            state_flush_ms: DEFAULT_STATE_FLUSH_MS,
         };
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -89,12 +98,15 @@ impl DaemonHandle {
     /// `stop_only`. The daemon removes the stale socket file on bind. Must be
     /// called after `stop_only`; reuses `self.socket` / `self.tmp`.
     pub async fn restart_with_timeout(&mut self, heartbeat_timeout: Duration) {
+        let state_file = self.tmp.path().join("state.json");
         let cfg = DaemonConfig {
             socket_path: self.socket.clone(),
             heartbeat_timeout,
             broadcast_capacity: 256,
             drain_grace_ms: DEFAULT_DRAIN_GRACE_MS,
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
+            state_file,
+            state_flush_ms: DEFAULT_STATE_FLUSH_MS,
         };
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

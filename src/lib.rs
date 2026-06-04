@@ -9,12 +9,14 @@
 pub mod client;
 pub mod daemon;
 pub mod doctor;
+pub mod persist;
 pub mod protocol;
 pub mod reconnect;
 pub mod reload;
 
 pub use client::Client;
 pub use daemon::{DaemonConfig, run_daemon};
+pub use persist::{DurableState, StickyIntent, default_state_path, load as load_state, save as save_state};
 pub use protocol::{ClaimRecord, ClientMessage, DrainNotice, PeerRecord, Reply, ServerEvent};
 pub use reconnect::{ReconnectConfig, backoff_delay, reconnect_subscribe};
 
@@ -47,3 +49,8 @@ pub const DEFAULT_DRAIN_GRACE_MS: u64 = 200;
 /// (PRD-agorabus-drain-notice). Subscribers are advised to wait at least
 /// this long before reconnecting to avoid a thundering-herd on rebind.
 pub const DEFAULT_DRAIN_RESUME_HINT_MS: u64 = 3_000;
+
+/// Default debounce window in milliseconds for state-flush writes
+/// (PRD-agorabus-state-persist). A burst of mutations within this window
+/// coalesces into a single write.
+pub const DEFAULT_STATE_FLUSH_MS: u64 = 250;
