@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.9.0 — 2026-06-04
+
+The agorabus daemon keeps its claims table and sticky intents in memory
+only. A restart — exactly the operation vigil wants to make routine —
+silently drops every active chord-claim lock and every intent string. A
+file-lock another session is holding through agorabus vanishes the moment
+the bus is rolled. This PRD journals the durable slice of bus state
+(claims + sticky intents) to `~/.cache/agorabus/state.json` on mutation
+and on drain, and rehydrates it on start, so a reload does not quietly
+revoke locks.
+
 ## v0.8.0 — 2026-05-29
 
 Add `agorabus reload` subcommand (PRD-agorabus-reload): one non-destructive
