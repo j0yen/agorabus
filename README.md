@@ -55,8 +55,36 @@ This project was scaffolded from a PRD via the `autobuilder` pipeline. The MUST-
 
 Each AC has a matching integration test under `tests/acceptance_ac<n>.rs`.
 
+## Claim guard
+
+`ClaimGuard` provides a lifetime-bound handle on an advisory claim: it
+acquires the claim, auto-renews the TTL lease in the background, and
+releases on drop or via an explicit awaitable `release()`.
+
+```rust
+use agorabus::{Client, default_socket_path};
+use std::time::Duration;
+
+let socket = default_socket_path();
+let mut client = Client::connect(&socket).await?;
+let _ = client.announce("my-daemon", std::process::id(), "/", "hold-example").await?;
+let guard = client.hold_claim(
+    "/dev/audio",
+    Duration::from_secs(30),
+    &socket,
+    "my-daemon",
+).await?;
+// ... do work ...
+guard.release().await?;  // or just drop(guard) for best-effort
+```
+
+Renew failures (bus unreachable) are logged and retried; a transient bus
+blip does not permanently drop the claim.
+
 ## Recent
 
+- **v0.10.0** — `ClaimGuard`: lifetime-bound claim handle with auto-renew, drop release, and explicit `release()`. `Client::hold_claim()` convenience method. See `src/claim_guard.rs`.
+- **v0.9.0** — durable claims+intents: state journaled to `~/.cache/agorabus/state.json`, rehydrated on restart.
 - **v0.8.0** — `agorabus reload`: one non-destructive command to roll the running bus daemon. Resolves daemon pid, checks binary freshness, snapshots peers, SIGTERMs old daemon, relaunches fresh binary, polls until pre-bounce sessions reconnect, emits structured verdict `{old_pid, new_pid, binary_before, binary_after, peers_before, peers_after, peers_recovered, peers_missing, elapsed_ms, status}`.
 - **v0.7.0** — graceful drain notice on shutdown: SIGTERM/SIGINT broadcasts `{"op":"bus.draining","resume_after_ms":N}` before closing connections.
 - **v0.6.0** — subscriber reconnect: clients survive daemon bounces and re-register the same session_id automatically.

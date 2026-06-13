@@ -322,6 +322,29 @@ impl Client {
         (self.write, self.reader)
     }
 
+    /// Acquire `path` and return a [`ClaimGuard`] that auto-renews the lease.
+    ///
+    /// This is a convenience wrapper around [`ClaimGuard::hold`]. The client
+    /// is consumed by the guard (it becomes the transport for the guard's
+    /// renewal loop). Pass the same `socket_path` and `session_id` that were
+    /// used to connect and announce this client so the guard can open a fresh
+    /// connection to recover from transient bus blips.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`ClaimGuard::hold`].
+    ///
+    /// [`ClaimGuard`]: crate::claim_guard::ClaimGuard
+    pub async fn hold_claim(
+        self,
+        path: &str,
+        ttl: std::time::Duration,
+        socket_path: &std::path::Path,
+        session_id: &str,
+    ) -> Result<crate::claim_guard::ClaimGuard> {
+        crate::claim_guard::ClaimGuard::hold(self, socket_path, session_id, path, ttl).await
+    }
+
     async fn send_line<T: serde::Serialize>(&mut self, value: &T) -> Result<()> {
         let mut buf = serde_json::to_vec(value).context("serializing client msg")?;
         buf.push(b'\n');

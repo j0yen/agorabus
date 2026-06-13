@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.10.0 — 2026-06-13
+
+Add `ClaimGuard` — a lifetime-bound handle that acquires an agorabus advisory
+claim, auto-renews it before TTL expiry, and releases it on drop or explicit
+`ClaimGuard::release()` (PRD-changeover-claim-guard).
+
+**New surface:**
+- `ClaimGuard::hold(client, socket_path, session_id, path, ttl)` — acquire
+  and start auto-renew. The client is consumed by the guard.
+- `Client::hold_claim(path, ttl, socket_path, session_id)` — convenience
+  wrapper on `Client` that calls `ClaimGuard::hold`.
+- `ClaimGuard::release(self) -> Result<()>` — explicit awaitable release for
+  SIGTERM handlers.
+- `impl Drop for ClaimGuard` — best-effort fire-and-forget release.
+
+Renew failures (bus unreachable) are logged and the loop retries via a fresh
+connection; the claim is never permanently abandoned on a transient bus blip.
+
+**Example:**
+```rust
+let guard = client.hold_claim(path, Duration::from_secs(30), &socket, &session_id).await?;
+// ... work ...
+guard.release().await?;
+```
+
 ## v0.9.0 — 2026-06-04
 
 The agorabus daemon keeps its claims table and sticky intents in memory

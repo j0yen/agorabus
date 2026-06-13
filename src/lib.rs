@@ -6,6 +6,7 @@
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+pub mod claim_guard;
 pub mod client;
 pub mod daemon;
 pub mod doctor;
@@ -14,6 +15,7 @@ pub mod protocol;
 pub mod reconnect;
 pub mod reload;
 
+pub use claim_guard::ClaimGuard;
 pub use client::Client;
 pub use daemon::{DaemonConfig, run_daemon};
 pub use persist::{DurableState, StickyIntent, default_state_path, load as load_state, save as save_state};
