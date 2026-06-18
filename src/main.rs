@@ -189,6 +189,10 @@ enum Command {
     /// binary_before/after, peers_before/after/recovered, elapsed_ms, status).
     ///
     /// Default posture is `--dry-run`: prints the plan without mutating.
+    ///
+    /// With `--build`: recompile via cloudbuild.sh before the bounce. The
+    /// build is a subprocess to cloudbuild (never in-process cargo). If the
+    /// build fails, the reload aborts and the running daemon is not touched.
     Reload {
         /// Output shape: `text` (human table) or `json`.
         #[arg(long, default_value = "text")]
@@ -217,6 +221,17 @@ enum Command {
         /// Override the installed binary path (for testing / scripts).
         #[arg(long)]
         installed_path: Option<PathBuf>,
+        /// Recompile agorabus via cloudbuild before the bounce. The build is
+        /// routed through cloudbuild.sh as a subprocess (never local cargo).
+        /// If the build fails the reload aborts without touching the daemon.
+        /// Composes with `--dry-run` (default): prints the plan and the exact
+        /// cloudbuild command without mutating anything.
+        #[arg(long, default_value_t = false)]
+        build: bool,
+        /// Override the path to cloudbuild.sh (default: from
+        /// `AGORABUS_CLOUDBUILD` env or `~/.claude/skills/cloudbuild/cloudbuild.sh`).
+        #[arg(long, env = "AGORABUS_CLOUDBUILD")]
+        cloudbuild_path: Option<PathBuf>,
     },
 }
 
@@ -535,6 +550,8 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             drain_timeout_ms,
             reconnect_timeout_ms,
             installed_path,
+            build,
+            cloudbuild_path,
         } => {
             let Some(fmt) = ReloadFormat::parse(&format) else {
                 anyhow::bail!("invalid --format {format:?}; expected 'text' or 'json'");
@@ -548,6 +565,8 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
                 reconnect_timeout_ms,
                 format: fmt,
                 installed_path,
+                build,
+                cloudbuild_path,
             };
             let (verdict, code) = run_reload(&cfg).await?;
             print_verdict(&verdict, fmt);

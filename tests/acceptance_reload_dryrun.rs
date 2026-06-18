@@ -45,6 +45,8 @@ fn ac6_no_daemon_without_start_if_absent_fails() {
             reconnect_timeout_ms: 500,
             format: ReloadFormat::Text,
             installed_path: None,
+            build: false,
+            cloudbuild_path: None,
         };
         let (verdict, _code) = run_reload(&cfg).await.unwrap();
         // No daemon was started; the /proc scan will not find an agorabus daemon
@@ -97,6 +99,8 @@ fn ac1_dryrun_does_not_mutate_daemon() {
             reconnect_timeout_ms: 500,
             format: ReloadFormat::Json,
             installed_path: None,
+            build: false,
+            cloudbuild_path: None,
         };
         let (verdict, _code) = run_reload(&cfg).await.unwrap();
 
@@ -154,6 +158,8 @@ fn ac3_require_fresh_verdict_shape_with_in_process_daemon() {
             reconnect_timeout_ms: 500,
             format: ReloadFormat::Json,
             installed_path: Some(nonexistent),
+            build: false,
+            cloudbuild_path: None,
         };
         let (verdict, _code) = run_reload(&cfg).await.unwrap();
 
@@ -190,6 +196,9 @@ fn ac4_verdict_json_has_all_required_fields() {
         peers_missing: vec![],
         elapsed_ms: 312,
         status: ReloadStatus::Reloaded,
+        build_command: None,
+        install_dest: None,
+        build_skipped: None,
     };
 
     let json: serde_json::Value = serde_json::to_value(&v).unwrap();
@@ -254,6 +263,9 @@ fn ac5_degraded_verdict_reported_not_hidden() {
         peers_missing: vec!["s2".to_string()],
         elapsed_ms: 8001,
         status: ReloadStatus::ReloadedDegraded,
+        build_command: None,
+        install_dest: None,
+        build_skipped: None,
     };
 
     let json: serde_json::Value = serde_json::to_value(&v).unwrap();

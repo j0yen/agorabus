@@ -263,7 +263,7 @@ mod tests {
         // TTL = 1 second; ts far in the past so the entry is immediately stale.
         let mut store = FleetStore::with_ttl(1);
         // Manually insert a stale entry by announcing then backdating via a fresh store.
-        let mut store2 = FleetStore::with_ttl(1);
+        let store2 = FleetStore::with_ttl(1);
         let ts = unix_now().saturating_sub(10); // 10 seconds ago
         let ev = make_event("stale-s1", "node", ts);
         // The entry's last_seen_unix_secs is set by unix_now() inside announce(),

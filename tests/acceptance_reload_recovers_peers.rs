@@ -131,6 +131,9 @@ fn ac2_reload_verdict_struct_encodes_full_recovery() {
         peers_missing: vec![],
         elapsed_ms: 1_200,
         status: ReloadStatus::Reloaded,
+        build_command: None,
+        install_dest: None,
+        build_skipped: None,
     };
 
     // AC2: new_pid must differ from old_pid (new daemon was launched).
