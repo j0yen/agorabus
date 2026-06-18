@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.11.0 — 2026-06-18
+
+Added fleet-wide peer presence to agorabus (tether-presence PRD).
+
+Changes:
+- PeerRecord gains optional `node` field (backward-compatible; absent for local peers)
+- New FleetPresenceEvent type + wm.fleet.presence.* subjects + TTL constant
+- FleetStore: in-memory store for remote peers with announce/remove/live_peers
+- merge_peers() / peer_age_secs() pure utilities
+- Client.announce_with_node() for tagging peers with a node name
+- Daemon captures node from Announce op into PeerRecord
+- `agorabus peers --fleet` merges remote peers from wm.fleet.presence.announce
+- 7 new integration tests (fleet_presence_acs.rs); all 50+ existing tests green
+
 ## v0.10.0 — 2026-06-13
 
 Add `ClaimGuard` — a lifetime-bound handle that acquires an agorabus advisory
