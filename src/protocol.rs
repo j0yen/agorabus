@@ -40,10 +40,52 @@ pub struct PeerRecord {
     pub working_paths: Vec<String>,
     /// UNIX timestamp (seconds) of the most recent message from this peer.
     pub last_heartbeat_unix_secs: u64,
+    /// Node (hostname / Tailscale name) on which this peer is running.
+    ///
+    /// `None` (or absent on the wire) means the same node as the recipient —
+    /// i.e., a local UDS peer. Set by the daemon when a peer announces with
+    /// a `node` field, or when a remote presence event is mirrored from
+    /// `wm.fleet.presence.announce`. Backward-compatible: existing clients
+    /// that omit this field are recorded as local (node = None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
     /// Free-form additional metadata.
     #[serde(default)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
+
+/// Compact presence event published/consumed on `wm.fleet.presence.announce`
+/// and `wm.fleet.presence.gone`.
+///
+/// This is the wire format for cross-node peer presence. The daemon publishes
+/// one of these when a local peer announces (so remote nodes can see it), and
+/// consumes incoming ones to mirror remote peers into `peers --fleet`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetPresenceEvent {
+    /// Session identifier of the peer.
+    pub session_id: String,
+    /// OS process id of the announcing session.
+    pub pid: u32,
+    /// Current working directory.
+    pub cwd: String,
+    /// Node name that originated this announcement.
+    pub node: String,
+    /// UNIX timestamp (seconds) when this event was emitted.
+    pub ts: u64,
+}
+
+/// Subject prefix used for fleet-wide peer presence events.
+///
+/// `wm.fleet.presence.announce` — peer came up.
+/// `wm.fleet.presence.gone`     — peer went down or TTL expired.
+pub const FLEET_PRESENCE_SUBJECT_ANNOUNCE: &str = "wm.fleet.presence.announce";
+/// Subject for fleet peer departure events.
+pub const FLEET_PRESENCE_SUBJECT_GONE: &str = "wm.fleet.presence.gone";
+
+/// TTL in seconds for a remote peer with no refresh. After this duration with
+/// no `wm.fleet.presence.announce` refresh the peer is considered stale and
+/// omitted from `--fleet` output.
+pub const FLEET_PEER_TTL_SECS: u64 = 300;
 
 /// Maximum number of entries allowed in [`PeerRecord::working_paths`].
 ///
@@ -72,6 +114,12 @@ pub enum ClientMessage {
         /// Optional intent string.
         #[serde(default)]
         intent: String,
+        /// Node name (hostname / Tailscale name) of the announcing machine.
+        ///
+        /// Absent (or `None`) means local — the daemon records the peer
+        /// without a node tag, preserving backward compatibility (AC2).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<String>,
     },
     /// Update one or more fields of this connection's announce record.
     Update {

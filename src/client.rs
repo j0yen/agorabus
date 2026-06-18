@@ -119,6 +119,10 @@ impl Client {
 
     /// Send the initial announce + return the reply.
     ///
+    /// `node` is optional: `None` means local (no cross-node identity).
+    /// Pass `Some("hostname")` to tag this peer with a node name for
+    /// fleet-wide presence (tether-presence extension).
+    ///
     /// # Errors
     ///
     /// Returns any error from [`Self::request`].
@@ -129,11 +133,33 @@ impl Client {
         cwd: &str,
         intent: &str,
     ) -> Result<Reply> {
+        self.announce_with_node(session_id, pid, cwd, intent, None)
+            .await
+    }
+
+    /// Announce with an explicit node tag.
+    ///
+    /// This is the fleet-presence variant: the `node` field is included in
+    /// the wire message, allowing the daemon to tag the peer record and
+    /// (eventually) publish it on `wm.fleet.presence.announce`.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`Self::request`].
+    pub async fn announce_with_node(
+        &mut self,
+        session_id: &str,
+        pid: u32,
+        cwd: &str,
+        intent: &str,
+        node: Option<String>,
+    ) -> Result<Reply> {
         let msg = ClientMessage::Announce {
             session_id: session_id.to_string(),
             pid,
             cwd: cwd.to_string(),
             intent: intent.to_string(),
+            node,
         };
         self.request(&msg).await
     }
