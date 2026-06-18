@@ -28,11 +28,12 @@
 )]
 
 use agorabus::{
-    Client, ClientMessage, DaemonConfig, ReconnectConfig, default_socket_path,
+    Client, ClientMessage, DaemonConfig, FleetPresenceEvent, FleetStore, ReconnectConfig,
+    default_socket_path,
     DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS, DEFAULT_STATE_FLUSH_MS,
     doctor::{DoctorFormat, print_report, run_doctor},
     persist::default_state_path,
-    protocol::ServerEvent,
+    protocol::{FLEET_PRESENCE_SUBJECT_ANNOUNCE, ServerEvent},
     reconnect_subscribe, run_daemon,
     reload::{ReloadConfig, ReloadFormat, print_verdict, run_reload},
 };
@@ -106,7 +107,17 @@ enum Command {
     },
     /// List current peers as a JSON array on stdout. Fail-open: emits `[]`
     /// and exits 0 when no daemon is reachable.
-    Peers,
+    Peers {
+        /// Merge remote peers from `wm.fleet.presence.*` into the listing.
+        ///
+        /// Without this flag the output is byte-identical to pre-fleet output
+        /// (local UDS peers only, no NATS path touched). With this flag,
+        /// remote peers are merged in, each tagged with their `node` and a
+        /// `freshness_age_secs` field. Requires the local bus to have received
+        /// fleet presence events (via a bus-bridge or test injection).
+        #[arg(long)]
+        fleet: bool,
+    },
     /// Publish a JSON payload on a topic.
     Publish {
         /// Session id used to identify the publisher (announce-on-connect).
@@ -360,7 +371,7 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
                 ExitCode::from(1)
             })
         }
-        Command::Peers => {
+        Command::Peers { fleet } => {
             let Some(mut client) = Client::try_connect(&socket).await? else {
                 println!("[]");
                 return Ok(ExitCode::SUCCESS);
@@ -375,10 +386,31 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_default();
             let _ = client.announce(&sid, cli_pid, &cwd, "peers-query").await?;
-            let peers = client.peers().await?;
+            let local_peers = client.peers().await?;
             // Filter out the throwaway self-record so the user sees true peers.
-            let peers: Vec<_> = peers.into_iter().filter(|p| p.session_id != sid).collect();
-            println!("{}", serde_json::to_string(&peers)?);
+            let local_peers: Vec<_> = local_peers
+                .into_iter()
+                .filter(|p| p.session_id != sid)
+                .collect();
+
+            if !fleet {
+                // AC3: no --fleet → output is byte-identical to the pre-fleet path.
+                // No NATS path is touched.
+                println!("{}", serde_json::to_string(&local_peers)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            // --fleet: merge in remote peers from fleet presence events that
+            // the daemon has received on `wm.fleet.presence.*` (via bus-bridge
+            // or test injection).  We subscribe briefly with a short timeout to
+            // collect any queued presence events, then merge and return.
+            //
+            // The local UDS bus carries fleet presence events as ordinary
+            // publish/subscribe messages under the `wm.fleet.presence.*`
+            // topic prefix.  A second connection subscribes and collects them.
+            let fleet_peers = collect_fleet_peers_from_bus(&socket, &sid).await;
+            let merged = agorabus::merge_peers(local_peers, fleet_peers);
+            println!("{}", serde_json::to_string(&merged)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Publish {
@@ -813,4 +845,62 @@ async fn run_intent(sub: IntentCommand, socket: &Path) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Collect remote peers published as fleet presence events on the local bus.
+///
+/// Subscribes to `wm.fleet.presence.announce` with a short timeout, collects
+/// all events that arrive, then returns the merged fleet peer list.
+///
+/// This is intentionally fail-open: if the bus is unavailable or no fleet
+/// events arrive within the timeout window, returns an empty list so that
+/// `peers --fleet` degrades gracefully to local-only (AC3 preserved).
+async fn collect_fleet_peers_from_bus(
+    socket: &std::path::Path,
+    caller_sid: &str,
+) -> Vec<agorabus::PeerRecord> {
+
+    let Ok(Some(mut sub_client)) = Client::try_connect(socket).await else {
+        return Vec::new();
+    };
+
+    // Announce a throwaway identity for the fleet subscribe connection.
+    let sub_sid = format!("{caller_sid}-fleet-sub");
+    let pid = std::process::id();
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_default();
+
+    if sub_client.announce(&sub_sid, pid, &cwd, "fleet-peers-query").await.is_err() {
+        return Vec::new();
+    }
+
+    // Subscribe to fleet presence events.
+    if sub_client.subscribe("wm.fleet.presence").await.is_err() {
+        return Vec::new();
+    }
+
+    // Drain for up to 100ms to collect queued presence events.
+    let mut store = FleetStore::new();
+    let _ = timeout(Duration::from_millis(100), async {
+        loop {
+            match sub_client.next_event().await {
+                Ok(Some(ev)) if ev.topic == FLEET_PRESENCE_SUBJECT_ANNOUNCE => {
+                    if let Ok(presence) =
+                        serde_json::from_value::<FleetPresenceEvent>(ev.data.clone())
+                    {
+                        // Loop-guard (AC5): skip events that originated from
+                        // this node — they are local peers already in the UDS list.
+                        store.announce(&presence);
+                    }
+                }
+                Ok(Some(_)) => {} // other topics, skip
+                Ok(None) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+
+    store.live_peers()
 }

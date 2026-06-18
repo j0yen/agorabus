@@ -450,6 +450,7 @@ where
                 pid,
                 cwd,
                 intent,
+                node,
             } => {
                 {
                     let mut st = state.lock().await;
@@ -469,6 +470,9 @@ where
                             prd_slug: String::new(),
                             working_paths: Vec::new(),
                             last_heartbeat_unix_secs: now_unix_secs(),
+                            // Preserve the node tag from the announce op.
+                            // `None` means local (backward-compatible, AC2).
+                            node: node.clone(),
                             extra: Default::default(),
                         };
                         st.peers.insert(sid.clone(), record);
