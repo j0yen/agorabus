@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.12.0 — 2026-06-18
+
+Add `--build` flag to `agorabus reload`: shells out to cloudbuild.sh before the daemon bounce (never local cargo); aborts on build failure without touching the live daemon; composes with `--dry-run` to emit the build+install+bounce plan; skips rebuild when binary is already current under `--require-fresh` (default).
+
 ## v0.11.0 — 2026-06-18
 
 Added fleet-wide peer presence to agorabus (tether-presence PRD).
