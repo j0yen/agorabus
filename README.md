@@ -53,7 +53,7 @@ A subscriber survives a daemon bounce and re-registers its `session_id` on its o
 | `heartbeat` | send a single heartbeat; `--tool` records the last tool invoked |
 | `claim` | advisory soft-locks on filesystem paths — `acquire` / `release` / `list` |
 | `intent` | structured per-session intent (active skill, PRD slug, working paths) — `set` / `list` |
-| `doctor` | compare the running daemon's image against the installed binary (0 current, 1 stale, 2 unknown) |
+| `doctor` | compare the running daemon's image against the installed binary (0 current, 1 stale, 2 unknown); also reports the NATS-uplink state, informational only |
 | `reload` | non-destructive daemon bounce; defaults to `--dry-run` |
 
 ### Claims
@@ -71,6 +71,66 @@ agorabus claim release --session s1 --path ~/.claude/settings.json
 ### Reload
 
 `agorabus reload` rolls a running daemon without dropping its peers: it resolves the daemon pid, checks binary freshness, snapshots the peer set, SIGTERMs the old daemon, relaunches the fresh binary, and polls until the pre-bounce sessions reconnect. It emits a structured verdict — `{old_pid, new_pid, binary_before, binary_after, peers_before, peers_after, peers_recovered, peers_missing, elapsed_ms, status}`. The default posture is `--dry-run`, which prints the plan without touching anything; pass `--apply` (or `--no-dry-run`) to perform it. With `--build`, it recompiles through `cloudbuild.sh` first — never in-process cargo — and aborts without touching the daemon if the build fails.
+
+## NATS uplink (fleet-wide bus)
+
+agorabus is per-machine by design — the UDS socket never leaves the box. The
+uplink is an *optional* extension that relays local topics to the fleet's
+NATS transport, so a `publish` on one node is heard by a `subscribe` on
+another, with no second daemon and no new secrets. It is off unless you turn
+it on: with no config file, a v0.13.0 daemon behaves exactly like v0.12.0.
+
+Enable it by writing `~/.config/agorabus/uplink.toml`:
+
+```toml
+enabled = true
+url = "nats://127.0.0.1:4222"   # the local NATS leaf — default, usually omit
+node = "carbon"                 # defaults to the lowercased hostname
+```
+
+All three keys are optional; a key you omit takes its default. A malformed
+file logs one error line and falls back to uplink-off rather than crashing
+the daemon.
+
+**The uplink connects to the local leaf, never to hub directly** — the leaf
+already holds hub auth, so agorabus never carries fleet credentials.
+Reconnects use the same bounded-backoff shape as `subscribe`'s reconnect
+loop; a dead leaf degrades to local-only bus behavior with the reconnect
+retrying in the background, never blocking or crashing the daemon.
+
+Subject mapping is mechanical: local topic `T` mirrors to NATS subject
+`wm.bus.T`, and the daemon subscribes to the wildcard `wm.bus.>` for
+everything the fleet sends back. Every relayed message — in either
+direction — travels wrapped in a small envelope:
+
+```json
+{"origin_node": "carbon", "data": <original JSON payload>}
+```
+
+`origin_node` is what makes the relay loop-safe: a daemon drops any incoming
+message whose `origin_node` is its own (NATS echoes your own publish back to
+every subscriber, including you), and a message that arrived *via* the
+uplink is never re-published back out — so a fleet of N nodes never
+amplifies a message into N copies.
+
+Local peer presence rides the same mechanism: each daemon periodically
+re-announces its own local peers on `wm.fleet.presence.announce`, which the
+generic relay carries to every other uplinked node with no special-casing.
+`agorabus peers --fleet` merges those in, tagging each with a `node` field;
+plain `agorabus peers` is untouched — it only ever returns genuinely local
+peers, byte-compatible with pre-uplink output. A remote peer whose node goes
+quiet (daemon killed, network partition) simply ages out of the fleet view
+once its last re-announcement passes the peer TTL — there's no separate
+"gone" message to miss.
+
+`agorabus doctor` reports the uplink state as one extra line —
+`uplink: disabled` / `uplink: connected <url>` / `uplink: reconnecting <err>`
+— purely informational: it never changes doctor's exit code.
+
+**Next step:** today's relay is fire-and-forget (a node offline when a
+message is published never sees it). JetStream-backed durable delivery for
+offline nodes is the natural follow-on and is intentionally out of scope
+here.
 
 ## The ClaimGuard handle
 
@@ -96,7 +156,7 @@ Newline-delimited JSON over the socket. A client's first message must be an `ann
 
 ## Where it fits
 
-agorabus is the single-host coordination layer of the wintermute fleet. Local peers live on the UDS; with `--fleet`, `peers` merges remote peers carried over NATS `wm.fleet.presence.*` subjects (via agorabus-nats-bridge), each tagged with its node and a freshness age. It was built through the [autobuilder](https://github.com/j0yen/autobuilder) pipeline and originally lived as a subdirectory of the [wintermute](https://github.com/j0yen/wintermute) monorepo; this is a standalone snapshot.
+agorabus is the single-host coordination layer of the wintermute fleet. Local peers live on the UDS; with `--fleet`, `peers` merges in remote peers carried over NATS `wm.fleet.presence.*` subjects via agorabus's own optional [NATS uplink](#nats-uplink-fleet-wide-bus) (no separate bridge process — the planned `wm-busbridge` was retired in favor of this), each tagged with its node and a freshness age. It was built through the [autobuilder](https://github.com/j0yen/autobuilder) pipeline and originally lived as a subdirectory of the [wintermute](https://github.com/j0yen/wintermute) monorepo; this is a standalone snapshot.
 
 ## License
 

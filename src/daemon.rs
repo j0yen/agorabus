@@ -20,7 +20,11 @@
 )]
 
 use crate::persist::{DurableState, StickyIntent, default_state_path, load as load_state, save as save_state};
-use crate::protocol::{ClaimRecord, ClientMessage, DrainNotice, PeerRecord, Reply, ServerEvent};
+use crate::protocol::{
+    ClaimRecord, ClientMessage, DrainNotice, FLEET_PRESENCE_SUBJECT_ANNOUNCE, FleetPresenceEvent,
+    PeerRecord, Reply, ServerEvent,
+};
+use crate::uplink::{UplinkConfig, UplinkStatus};
 use anyhow::{Context as _, Result};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -60,6 +64,11 @@ pub struct DaemonConfig {
     /// Debounce window in milliseconds for state-flush writes. A burst of
     /// mutations within this window coalesces into a single write. Default: 250 ms.
     pub state_flush_ms: u64,
+    /// Optional NATS uplink configuration (PRD-agorabus-nats-uplink).
+    /// `UplinkConfig::default()` (`enabled: false`) means the daemon never
+    /// touches the network for this feature — behavior is byte-identical to
+    /// v0.12.0 (AC1).
+    pub uplink: UplinkConfig,
 }
 
 impl DaemonConfig {
@@ -74,6 +83,7 @@ impl DaemonConfig {
             drain_resume_hint_ms: crate::DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file: default_state_path(),
             state_flush_ms: crate::DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         }
     }
 }
@@ -125,11 +135,19 @@ impl BusState {
 }
 
 /// One pub/sub message routed through the daemon-wide broadcast channel.
+///
+/// `pub(crate)` so [`crate::uplink`] can subscribe to the same channel and
+/// relay messages in both directions without a second, parallel bus.
 #[derive(Debug, Clone, Serialize)]
-struct BroadcastMsg {
-    topic: String,
-    data: serde_json::Value,
-    from: String,
+pub(crate) struct BroadcastMsg {
+    pub(crate) topic: String,
+    pub(crate) data: serde_json::Value,
+    pub(crate) from: String,
+    /// True for a message that arrived *via* the NATS uplink. Such messages
+    /// are delivered to local subscribers exactly like any other publish,
+    /// but must never be relayed back out — that is the loop-prevention
+    /// invariant the uplink relies on (PRD-agorabus-nats-uplink AC8).
+    pub(crate) from_uplink: bool,
 }
 
 /// Run the daemon until the listener errors or `shutdown` resolves.
@@ -141,6 +159,13 @@ struct BroadcastMsg {
 ///
 /// Returns the error from creating parent dirs, binding, or chmod'ing the
 /// socket. Accept-loop errors are logged but do not terminate the daemon.
+// Cognitive complexity is high by design, same rationale as `handle_line`:
+// this is the single top-level orchestrator (bind, rehydrate state, spawn
+// the persist task, conditionally spawn the uplink tasks, run the
+// accept/shutdown select loop) and splitting it obscures the shutdown
+// sequencing invariants (drain notice -> grace window -> abort -> final
+// flush) that make a clean bounce possible.
+#[allow(clippy::cognitive_complexity)]
 pub async fn run_daemon(
     config: DaemonConfig,
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -220,6 +245,36 @@ pub async fn run_daemon(
     // that subscriber UnixStreams are closed and clients receive EOF promptly.
     let mut conn_tasks: JoinSet<()> = JoinSet::new();
 
+    // Optional NATS uplink (PRD-agorabus-nats-uplink). `uplink_status` always
+    // exists (defaults to `Disabled`) so `ClientMessage::UplinkStatus` always
+    // has an answer; the relay + presence tasks are only spawned when the
+    // uplink is actually enabled — with no `uplink.toml`, this block is a
+    // no-op and the daemon never touches the network for this feature (AC1).
+    let uplink_status: Arc<Mutex<UplinkStatus>> = Arc::new(Mutex::new(UplinkStatus::Disabled));
+    let mut uplink_tasks: JoinSet<()> = JoinSet::new();
+    if config.uplink.enabled {
+        let relay_cfg = config.uplink.clone();
+        let relay_bcast = bcast_tx.clone();
+        let relay_status = Arc::clone(&uplink_status);
+        uplink_tasks.spawn(async move {
+            crate::uplink::run_uplink(relay_cfg, relay_bcast, relay_status).await;
+        });
+
+        let presence_state = Arc::clone(&state);
+        let presence_bcast = bcast_tx.clone();
+        let presence_node = config.uplink.node.clone();
+        let presence_interval_ms = config.uplink.fleet_presence_interval_ms;
+        uplink_tasks.spawn(async move {
+            run_fleet_presence_broadcaster(
+                presence_state,
+                presence_bcast,
+                presence_node,
+                presence_interval_ms,
+            )
+            .await;
+        });
+    }
+
     loop {
         tokio::select! {
             _ = &mut shutdown => {
@@ -247,6 +302,13 @@ pub async fn run_daemon(
                 // races when the daemon bounces on the same socket path).
                 while conn_tasks.join_next().await.is_some() {}
 
+                // Uplink relay + presence-broadcaster tasks (if spawned) hold
+                // a NATS client and a periodic ticker; neither is line-based
+                // and neither would ever observe shutdown on its own, so they
+                // are aborted unconditionally alongside the connection tasks.
+                uplink_tasks.abort_all();
+                while uplink_tasks.join_next().await.is_some() {}
+
                 // Final flush: write the current durable state to the journal
                 // before exit, capturing any mutations that arrived after the
                 // last debounced flush.
@@ -273,9 +335,11 @@ pub async fn run_daemon(
                         let drain_rx = drain_tx.subscribe();
                         let persist = persist_tx.clone();
                         let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
+                        let uplink_status = Arc::clone(&uplink_status);
                         conn_tasks.spawn(async move {
                             if let Err(e) = handle_connection(
                                 stream, state, bcast, drain_rx, persist, heartbeat_timeout, conn_id,
+                                uplink_status,
                             ).await {
                                 // Per-connection errors are noisy in normal operation
                                 // (clients disconnect). Drop without polluting stdout/stderr.
@@ -293,6 +357,7 @@ pub async fn run_daemon(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: UnixStream,
     state: Arc<Mutex<BusState>>,
@@ -301,6 +366,7 @@ async fn handle_connection(
     persist: tokio::sync::mpsc::Sender<()>,
     heartbeat_timeout: Duration,
     conn_id: u64,
+    uplink_status: Arc<Mutex<UplinkStatus>>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
@@ -328,6 +394,7 @@ async fn handle_connection(
                                 &mut write_half,
                                 heartbeat_timeout,
                                 conn_id,
+                                &uplink_status,
                             ).await?;
                         }
                         Ok(None) | Err(_) => break,
@@ -377,6 +444,7 @@ async fn handle_connection(
                                 &mut write_half,
                                 heartbeat_timeout,
                                 conn_id,
+                                &uplink_status,
                             )
                             .await?;
                         }
@@ -424,6 +492,7 @@ async fn handle_line<W>(
     write_half: &mut W,
     heartbeat_timeout: Duration,
     conn_id: u64,
+    uplink_status: &Arc<Mutex<UplinkStatus>>,
 ) -> Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -575,6 +644,7 @@ where
                 topic,
                 data,
                 from: sid.clone(),
+                from_uplink: false,
             });
             // Also refresh heartbeat: publishing counts as activity.
             let mut st = state.lock().await;
@@ -652,6 +722,7 @@ where
                             "session_id": prev.session_id,
                         }),
                         from: sid.clone(),
+                        from_uplink: false,
                     });
                 }
             }
@@ -679,6 +750,7 @@ where
                     "reason": reason,
                 }),
                 from: sid.clone(),
+                from_uplink: false,
             });
             let payload = serde_json::json!({
                 "path": path,
@@ -713,6 +785,7 @@ where
                         "session_id": sid,
                     }),
                     from: sid.clone(),
+                    from_uplink: false,
                 });
             }
             let payload = serde_json::json!({"released": released});
@@ -724,6 +797,13 @@ where
             st.prune_expired_claims(now);
             let snapshot: Vec<ClaimRecord> = st.claims.values().cloned().collect();
             drop(st);
+            let value = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+            write_json_line(write_half, &Reply::ok_with(value)).await?;
+        }
+        ClientMessage::UplinkStatus {} => {
+            // Report-only (PRD-agorabus-nats-uplink AC11): never errors, and
+            // has no bearing on this connection's session state.
+            let snapshot = uplink_status.lock().await.clone();
             let value = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
             write_json_line(write_half, &Reply::ok_with(value)).await?;
         }
@@ -756,6 +836,53 @@ fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Periodically re-broadcast this daemon's local peers as
+/// `wm.fleet.presence.announce` events on the internal bus, so the uplink's
+/// generic relay-out carries them to the fleet (PRD-agorabus-nats-uplink
+/// requirement 4). Only spawned when the uplink is enabled — see
+/// `run_daemon`.
+///
+/// This deliberately reuses the *same* publish path as any client-originated
+/// `Publish` op (`bcast.send(BroadcastMsg { from_uplink: false, .. })`), so
+/// no special-casing is needed downstream: the uplink relay-out task treats
+/// this exactly like a local publish, and a stale entry (no further
+/// broadcasts because the peer's node went away) naturally ages out of a
+/// remote node's `FleetStore` past its TTL — no explicit "gone" event is
+/// needed for that (AC9).
+async fn run_fleet_presence_broadcaster(
+    state: Arc<Mutex<BusState>>,
+    bcast: broadcast::Sender<BroadcastMsg>,
+    node: String,
+    interval_ms: u64,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
+    loop {
+        ticker.tick().await;
+        let snapshot: Vec<PeerRecord> = {
+            let st = state.lock().await;
+            st.peers.values().cloned().collect()
+        };
+        for p in snapshot {
+            let ev = FleetPresenceEvent {
+                session_id: p.session_id,
+                pid: p.pid,
+                cwd: p.cwd,
+                node: node.clone(),
+                ts: now_unix_secs(),
+            };
+            let Ok(data) = serde_json::to_value(&ev) else {
+                continue;
+            };
+            let _ = bcast.send(BroadcastMsg {
+                topic: FLEET_PRESENCE_SUBJECT_ANNOUNCE.to_string(),
+                data,
+                from: "daemon-fleet-presence".to_string(),
+                from_uplink: false,
+            });
+        }
+    }
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<()> {

@@ -79,6 +79,12 @@ pub struct DoctorReport {
     pub prov_ts: Option<String>,
     /// Staleness verdict.
     pub verdict: Verdict,
+    /// NATS-uplink connection state (PRD-agorabus-nats-uplink), rendered as
+    /// text (`disabled` / `connected <url>` / `reconnecting <err>`).
+    /// `None` when no running daemon answered the query — report-only and
+    /// never affects [`run_doctor`]'s exit code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uplink: Option<String>,
 }
 
 /// Run the doctor check and return a report plus the appropriate [`ExitCode`].
@@ -98,6 +104,7 @@ pub fn run_doctor(installed_path: Option<&Path>) -> (DoctorReport, ExitCode) {
             ondisk_inode: None,
             prov_ts: None,
             verdict: Verdict::Unknown,
+            uplink: None,
         };
         return (report, ExitCode::from(2));
     };
@@ -150,6 +157,7 @@ pub fn run_doctor(installed_path: Option<&Path>) -> (DoctorReport, ExitCode) {
         ondisk_inode,
         prov_ts,
         verdict,
+        uplink: None,
     };
     (report, exit_code)
 }
@@ -173,6 +181,9 @@ pub fn print_report(report: &DoctorReport, format: DoctorFormat) {
             }
             if let Some(ref ts) = report.prov_ts {
                 println!("  prov_ts: {ts}");
+            }
+            if let Some(ref uplink) = report.uplink {
+                println!("  uplink: {uplink}");
             }
         }
         DoctorFormat::Json => match serde_json::to_string(report) {
@@ -415,6 +426,7 @@ mod tests {
             ondisk_inode: Some(67890),
             prov_ts: None,
             verdict: Verdict::StaleDeletedExe,
+            uplink: Some("disabled".into()),
         };
         // Just verify it doesn't panic.
         print_report(&r, DoctorFormat::Text);
@@ -429,6 +441,7 @@ mod tests {
             ondisk_inode: Some(111),
             prov_ts: Some("2026-05-29T00:00:00Z".into()),
             verdict: Verdict::Current,
+            uplink: None,
         };
         // Capture to string via JSON serialise (print_report outputs to stdout).
         let s = serde_json::to_string(&r).unwrap();

@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agorabus::{
     Client, DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS, DEFAULT_STATE_FLUSH_MS,
-    DaemonConfig, run_daemon,
+    DaemonConfig, UplinkConfig, run_daemon,
     protocol::ClaimRecord,
 };
 use common::DaemonHandle;
@@ -67,6 +67,7 @@ fn ac1_claims_survive_restart() {
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file: state_file.clone(),
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (rtx1, rrx1) = oneshot::channel::<()>();
         let (stx1, srx1) = oneshot::channel::<()>();
@@ -97,6 +98,7 @@ fn ac1_claims_survive_restart() {
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file,
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (rtx2, rrx2) = oneshot::channel::<()>();
         let (stx2, srx2) = oneshot::channel::<()>();
@@ -137,6 +139,7 @@ fn ac2_expired_claims_not_resurrected() {
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file: state_file.clone(),
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (rtx1, rrx1) = oneshot::channel::<()>();
         let (stx1, srx1) = oneshot::channel::<()>();
@@ -167,6 +170,7 @@ fn ac2_expired_claims_not_resurrected() {
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file,
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (rtx2, rrx2) = oneshot::channel::<()>();
         let (stx2, srx2) = oneshot::channel::<()>();
@@ -207,6 +211,7 @@ fn ac3_sticky_intent_survives_restart() {
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file: state_file.clone(),
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (rtx1, rrx1) = oneshot::channel::<()>();
         let (stx1, srx1) = oneshot::channel::<()>();
@@ -275,6 +280,7 @@ fn ac4_atomic_write_mode_0600() {
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file: state_file.clone(),
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (rtx, rrx) = oneshot::channel::<()>();
         let (stx, srx) = oneshot::channel::<()>();
@@ -332,6 +338,7 @@ fn ac5_corrupt_journal_starts_clean() {
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file: state_file.clone(),
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (rtx, rrx) = oneshot::channel::<()>();
         let (stx, srx) = oneshot::channel::<()>();

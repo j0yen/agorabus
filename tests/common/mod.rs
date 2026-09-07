@@ -4,13 +4,15 @@
 #![allow(dead_code)] // shared across many test files; some helpers are file-local in use
 #![allow(unreachable_pub)] // test-mod re-exported across many integration crates
 
+pub mod nats_harness;
+
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
 use agorabus::{
     DaemonConfig, DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS, DEFAULT_STATE_FLUSH_MS,
-    run_daemon,
+    UplinkConfig, run_daemon,
 };
 
 pub struct DaemonHandle {
@@ -33,6 +35,7 @@ impl DaemonHandle {
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file,
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -49,6 +52,37 @@ impl DaemonHandle {
 
     pub async fn start() -> Self {
         Self::start_with_timeout(Duration::from_secs(60)).await
+    }
+
+    /// Start a daemon with a NATS uplink configured (PRD-agorabus-nats-uplink
+    /// acceptance tests). `uplink.enabled` should be `true`; the caller is
+    /// responsible for having checked `nats_harness::nats_server_available()`
+    /// first (AC12) when the uplink is expected to actually connect.
+    pub async fn start_with_uplink(uplink: UplinkConfig) -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("sock");
+        let state_file = tmp.path().join("state.json");
+        let cfg = DaemonConfig {
+            socket_path: socket.clone(),
+            heartbeat_timeout: Duration::from_secs(60),
+            broadcast_capacity: 256,
+            drain_grace_ms: DEFAULT_DRAIN_GRACE_MS,
+            drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
+            state_file,
+            state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink,
+        };
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let join =
+            tokio::spawn(async move { run_daemon(cfg, Some(ready_tx), shutdown_rx).await });
+        ready_rx.await.expect("daemon ready");
+        Self {
+            socket,
+            tmp,
+            shutdown: Some(shutdown_tx),
+            join: Some(join),
+        }
     }
 
     /// Start with custom drain parameters (PRD-agorabus-drain-notice tests).
@@ -68,6 +102,7 @@ impl DaemonHandle {
             drain_resume_hint_ms,
             state_file,
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -107,6 +142,7 @@ impl DaemonHandle {
             drain_resume_hint_ms: DEFAULT_DRAIN_RESUME_HINT_MS,
             state_file,
             state_flush_ms: DEFAULT_STATE_FLUSH_MS,
+            uplink: UplinkConfig::default(),
         };
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

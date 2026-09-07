@@ -13,8 +13,10 @@
     clippy::future_not_send, // FleetStore is used in CLI, not hot async loops.
 )]
 
-use crate::protocol::{FLEET_PEER_TTL_SECS, FleetPresenceEvent, PeerRecord};
+use crate::client::Client;
+use crate::protocol::{FLEET_PEER_TTL_SECS, FLEET_PRESENCE_SUBJECT_ANNOUNCE, FleetPresenceEvent, PeerRecord};
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Key for the remote-peer dedup map: `(session_id, node)`.
@@ -159,6 +161,71 @@ pub fn merge_peers(local: Vec<PeerRecord>, remote: Vec<PeerRecord>) -> Vec<PeerR
 #[must_use]
 pub fn peer_age_secs(peer: &PeerRecord) -> u64 {
     unix_now().saturating_sub(peer.last_heartbeat_unix_secs)
+}
+
+/// Collect remote peers published as fleet presence events on the local bus.
+///
+/// Subscribes to `wm.fleet.presence.announce` with a short timeout, collects
+/// all events that arrive, then returns the merged fleet peer list. `ttl_secs`
+/// is the staleness window used to build the transient [`FleetStore`] — the
+/// production CLI path (`agorabus peers --fleet`) passes
+/// [`FLEET_PEER_TTL_SECS`]; tests pass a much smaller value so "a remote
+/// peer disappears within the TTL" (PRD-agorabus-nats-uplink AC9) doesn't
+/// require an actual multi-minute wait.
+///
+/// This is intentionally fail-open: if the bus is unavailable or no fleet
+/// events arrive within the timeout window, returns an empty list so that
+/// `peers --fleet` degrades gracefully to local-only.
+pub async fn collect_fleet_peers_from_bus(
+    socket: &Path,
+    caller_sid: &str,
+    ttl_secs: u64,
+) -> Vec<PeerRecord> {
+    let Ok(Some(mut sub_client)) = Client::try_connect(socket).await else {
+        return Vec::new();
+    };
+
+    // Announce a throwaway identity for the fleet subscribe connection.
+    let sub_sid = format!("{caller_sid}-fleet-sub");
+    let pid = std::process::id();
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_default();
+
+    if sub_client
+        .announce(&sub_sid, pid, &cwd, "fleet-peers-query")
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+
+    // Subscribe to fleet presence events.
+    if sub_client.subscribe("wm.fleet.presence").await.is_err() {
+        return Vec::new();
+    }
+
+    // Drain for up to 100ms to collect queued presence events.
+    let mut store = FleetStore::with_ttl(ttl_secs);
+    let _ = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match sub_client.next_event().await {
+                Ok(Some(ev)) if ev.topic == FLEET_PRESENCE_SUBJECT_ANNOUNCE => {
+                    if let Ok(presence) =
+                        serde_json::from_value::<FleetPresenceEvent>(ev.data.clone())
+                    {
+                        store.announce(&presence);
+                    }
+                }
+                Ok(Some(_)) => {} // other topics, skip
+                Ok(None) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+
+    store.live_peers()
 }
 
 #[cfg(test)]

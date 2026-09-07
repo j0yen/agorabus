@@ -268,6 +268,27 @@ impl Client {
         .await
     }
 
+    /// Query the daemon's NATS-uplink connection state
+    /// (PRD-agorabus-nats-uplink). Report-only: the daemon always replies
+    /// `ok`, even with the uplink disabled or reconnecting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on I/O failure or if the reply payload does not decode
+    /// as an [`crate::uplink::UplinkStatus`].
+    pub async fn uplink_status(&mut self) -> Result<crate::uplink::UplinkStatus> {
+        let reply = self.request(&ClientMessage::UplinkStatus {}).await?;
+        if !reply.ok {
+            return Err(anyhow!(
+                "uplink_status query failed: {}",
+                reply.error.unwrap_or_else(|| "(no error tag)".into())
+            ));
+        }
+        let data = reply.data.unwrap_or(serde_json::Value::Null);
+        let status = serde_json::from_value(data).context("decoding uplink status payload")?;
+        Ok(status)
+    }
+
     /// Snapshot of all currently-active claims.
     ///
     /// # Errors

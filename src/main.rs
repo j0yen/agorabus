@@ -28,12 +28,13 @@
 )]
 
 use agorabus::{
-    Client, ClientMessage, DaemonConfig, FleetPresenceEvent, FleetStore, ReconnectConfig,
-    default_socket_path,
+    Client, ClientMessage, DaemonConfig, ReconnectConfig,
+    default_socket_path, default_uplink_config_path, load_uplink_config,
     DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS, DEFAULT_STATE_FLUSH_MS,
     doctor::{DoctorFormat, print_report, run_doctor},
+    fleet::collect_fleet_peers_from_bus,
     persist::default_state_path,
-    protocol::{FLEET_PRESENCE_SUBJECT_ANNOUNCE, ServerEvent},
+    protocol::{FLEET_PEER_TTL_SECS, ServerEvent},
     reconnect_subscribe, run_daemon,
     reload::{ReloadConfig, ReloadFormat, print_verdict, run_reload},
 };
@@ -86,6 +87,11 @@ enum Command {
         /// mutations within this window are coalesced into a single write.
         #[arg(long, default_value_t = DEFAULT_STATE_FLUSH_MS)]
         state_flush_ms: u64,
+        /// Path to the optional NATS uplink config (PRD-agorabus-nats-uplink).
+        /// Defaults to `~/.config/agorabus/uplink.toml`; an absent file means
+        /// the uplink is off (behavior identical to v0.12.0).
+        #[arg(long)]
+        uplink_config: Option<PathBuf>,
     },
     /// One-shot announce + immediate disconnect.
     ///
@@ -336,7 +342,8 @@ fn main() -> ExitCode {
 
 async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
     match cmd {
-        Command::Daemon { heartbeat_timeout, drain_grace_ms, drain_resume_hint_ms, state_file, state_flush_ms } => {
+        Command::Daemon { heartbeat_timeout, drain_grace_ms, drain_resume_hint_ms, state_file, state_flush_ms, uplink_config } => {
+            let uplink = load_uplink_config(&uplink_config.unwrap_or_else(default_uplink_config_path));
             let cfg = DaemonConfig {
                 socket_path: socket,
                 heartbeat_timeout: Duration::from_secs(heartbeat_timeout),
@@ -345,6 +352,7 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
                 drain_resume_hint_ms,
                 state_file: state_file.unwrap_or_else(default_state_path),
                 state_flush_ms,
+                uplink,
             };
             let (_ready_tx, _ready_rx) = tokio::sync::oneshot::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -423,7 +431,7 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             // The local UDS bus carries fleet presence events as ordinary
             // publish/subscribe messages under the `wm.fleet.presence.*`
             // topic prefix.  A second connection subscribes and collects them.
-            let fleet_peers = collect_fleet_peers_from_bus(&socket, &sid).await;
+            let fleet_peers = collect_fleet_peers_from_bus(&socket, &sid, FLEET_PEER_TTL_SECS).await;
             let merged = agorabus::merge_peers(local_peers, fleet_peers);
             println!("{}", serde_json::to_string(&merged)?);
             Ok(ExitCode::SUCCESS)
@@ -515,8 +523,31 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
                 anyhow::bail!("invalid --format {format:?}; expected 'text' or 'json'");
             };
             // Pure introspection over /proc + the on-disk binary; no daemon
-            // connection needed (it inspects the daemon, doesn't talk to it).
-            let (report, code) = run_doctor(installed_path.as_deref());
+            // connection needed for the staleness verdict (it inspects the
+            // daemon, doesn't talk to it) — `code` is derived from this
+            // alone and is never touched by the uplink query below (AC11).
+            let (mut report, code) = run_doctor(installed_path.as_deref());
+
+            // Best-effort NATS-uplink status (PRD-agorabus-nats-uplink
+            // AC3/AC4): report-only, fail-open — no running daemon or a
+            // query error simply leaves `report.uplink` unset.
+            if let Ok(Some(mut client)) = Client::try_connect(&socket).await {
+                let sid = format!("cli-doctor-{}", std::process::id());
+                let cwd = std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+                    .unwrap_or_default();
+                if client
+                    .announce(&sid, std::process::id(), &cwd, "doctor-query")
+                    .await
+                    .is_ok()
+                {
+                    if let Ok(status) = client.uplink_status().await {
+                        report.uplink = Some(status.as_text());
+                    }
+                }
+            }
+
             print_report(&report, fmt);
             Ok(code)
         }
@@ -866,60 +897,3 @@ async fn run_intent(sub: IntentCommand, socket: &Path) -> Result<ExitCode> {
     }
 }
 
-/// Collect remote peers published as fleet presence events on the local bus.
-///
-/// Subscribes to `wm.fleet.presence.announce` with a short timeout, collects
-/// all events that arrive, then returns the merged fleet peer list.
-///
-/// This is intentionally fail-open: if the bus is unavailable or no fleet
-/// events arrive within the timeout window, returns an empty list so that
-/// `peers --fleet` degrades gracefully to local-only (AC3 preserved).
-async fn collect_fleet_peers_from_bus(
-    socket: &std::path::Path,
-    caller_sid: &str,
-) -> Vec<agorabus::PeerRecord> {
-
-    let Ok(Some(mut sub_client)) = Client::try_connect(socket).await else {
-        return Vec::new();
-    };
-
-    // Announce a throwaway identity for the fleet subscribe connection.
-    let sub_sid = format!("{caller_sid}-fleet-sub");
-    let pid = std::process::id();
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_default();
-
-    if sub_client.announce(&sub_sid, pid, &cwd, "fleet-peers-query").await.is_err() {
-        return Vec::new();
-    }
-
-    // Subscribe to fleet presence events.
-    if sub_client.subscribe("wm.fleet.presence").await.is_err() {
-        return Vec::new();
-    }
-
-    // Drain for up to 100ms to collect queued presence events.
-    let mut store = FleetStore::new();
-    let _ = timeout(Duration::from_millis(100), async {
-        loop {
-            match sub_client.next_event().await {
-                Ok(Some(ev)) if ev.topic == FLEET_PRESENCE_SUBJECT_ANNOUNCE => {
-                    if let Ok(presence) =
-                        serde_json::from_value::<FleetPresenceEvent>(ev.data.clone())
-                    {
-                        // Loop-guard (AC5): skip events that originated from
-                        // this node — they are local peers already in the UDS list.
-                        store.announce(&presence);
-                    }
-                }
-                Ok(Some(_)) => {} // other topics, skip
-                Ok(None) | Err(_) => break,
-            }
-        }
-    })
-    .await;
-
-    store.live_peers()
-}

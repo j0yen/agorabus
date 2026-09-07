@@ -15,14 +15,16 @@ pub mod persist;
 pub mod protocol;
 pub mod reconnect;
 pub mod reload;
+pub mod uplink;
 
 pub use claim_guard::ClaimGuard;
 pub use client::Client;
 pub use daemon::{DaemonConfig, run_daemon};
-pub use fleet::{FleetStore, merge_peers, peer_age_secs};
+pub use fleet::{FleetStore, collect_fleet_peers_from_bus, merge_peers, peer_age_secs};
 pub use persist::{DurableState, StickyIntent, default_state_path, load as load_state, save as save_state};
 pub use protocol::{ClaimRecord, ClientMessage, DrainNotice, FleetPresenceEvent, PeerRecord, Reply, ServerEvent};
 pub use reconnect::{ReconnectConfig, backoff_delay, reconnect_subscribe};
+pub use uplink::{UplinkConfig, UplinkStatus, default_node_name, default_uplink_config_path, load_uplink_config};
 
 use std::path::PathBuf;
 

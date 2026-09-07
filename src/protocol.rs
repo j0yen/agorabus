@@ -203,6 +203,11 @@ pub enum ClientMessage {
     /// Snapshot of all currently-active claims. Expired claims are pruned
     /// silently before returning. Reply payload is `Vec<ClaimRecord>`.
     ClaimList {},
+    /// Query the daemon's NATS-uplink connection state
+    /// (PRD-agorabus-nats-uplink). Report-only: always succeeds; a disabled
+    /// uplink simply replies with `{"state":"disabled"}`. Never affects any
+    /// other op or exit code.
+    UplinkStatus {},
 }
 
 /// Daemon-side record of an active advisory claim. Returned in the

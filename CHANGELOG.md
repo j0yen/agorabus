@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.13.0 — 2026-09-06
+
+Add an optional NATS uplink so agorabus's local pub/sub bus reaches every fleet node through the existing nats-leaf → hub topology (PRD-agorabus-nats-uplink). The never-built wm-busbridge idea retires in favor of this.
+
+Changes:
+- Optional config at `~/.config/agorabus/uplink.toml` (`enabled`, `url`, `node`); absent file = uplink off, byte-identical to v0.12.0 behavior
+- Daemon relays local publishes to NATS subject `wm.bus.<topic>` and delivers incoming `wm.bus.>` traffic to local subscribers, wrapped in an `{origin_node, data}` envelope
+- Loop prevention: self-origin messages are dropped, and messages received via the uplink are never re-published back out
+- Local peer presence relays over the same mechanism; `agorabus peers --fleet` merges in remote peers tagged with `node`; plain `agorabus peers` is byte-compatible with v0.12.0
+- `agorabus doctor` reports uplink state (`disabled` / `connected <url>` / `reconnecting <err>`) as informational-only — never changes doctor's exit code
+- Dead leaf at start or mid-run degrades to local-only bus with capped-backoff reconnect in the background
+- New integration harness spawns a throwaway `nats-server` on a random port for real round-trip/dedupe/reconnect acceptance tests; skips with an explicit message when `nats-server` is absent from `$PATH`
+- Next step (out of scope here): JetStream durable delivery for nodes that are offline when a message is published
+
 ## v0.12.0 — 2026-06-18
 
 Add `--build` flag to `agorabus reload`: shells out to cloudbuild.sh before the daemon bounce (never local cargo); aborts on build failure without touching the live daemon; composes with `--dry-run` to emit the build+install+bounce plan; skips rebuild when binary is already current under `--require-fresh` (default).
