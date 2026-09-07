@@ -1,0 +1,39 @@
+{
+  "schema": "autobuilder.gate_baseline.v1",
+  "recorded_at": "2026-09-07T03:15:18Z",
+  "head_sha": "c1aa508d4521f867851e50c2f9e3cc2317378dd3",
+  "receipts": [
+    {
+      "name": "intake",
+      "reason": "missing: /home/jsy/wintermute/agorabus/target/autobuilder/receipts/intake.json"
+    },
+    {
+      "name": "vti-plan",
+      "reason": "verdict=block not in [\"pass\"]"
+    },
+    {
+      "name": "risk-gate",
+      "reason": "missing: /home/jsy/wintermute/agorabus/target/autobuilder/receipts/risk-gate.json"
+    },
+    {
+      "name": "reviewer-agent",
+      "reason": "reviewer decision=block not in [\"pass\", \"concern\"]"
+    },
+    {
+      "name": "rollback-plan",
+      "reason": "verdict=block not in [\"pass\"]"
+    },
+    {
+      "name": "ci-checks",
+      "reason": "verdict=block not in [\"pass\", \"skipped\"]"
+    },
+    {
+      "name": "ac-traceability",
+      "reason": "verdict=block not in [\"pass\"]"
+    },
+    {
+      "name": "flake-audit",
+      "reason": "verdict=block not in [\"pass\", \"skipped\"]"
+    }
+  ]
+}
