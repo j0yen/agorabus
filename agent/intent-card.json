@@ -157,16 +157,6 @@
     }
   ],
   "created_at": "2026-05-23T00:00:00Z",
-  "carried_forward": {
-    "user_persona": true,
-    "unfakeable_metric": true,
-    "scope": true,
-    "non_goals": true,
-    "hard_constraints": true,
-    "five_whys_trace": true,
-    "created_at": true,
-    "ambiguities_resolved": true
-  },
   "ambiguities_resolved": [
     {
       "question": "PRD describes both Phase 0 (announce/peers/heartbeat) and Phases 1\u20134 (publish/subscribe, query-state, send, sub-agent integration, self-review). Which phases are in scope for v1?",
