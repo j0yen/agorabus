@@ -1018,6 +1018,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let stub_cb = tmp.path().join("cloudbuild.sh");
         std::fs::write(&stub_cb, "#!/bin/sh\nexit 0\n").unwrap();
+        // Make stub executable.
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&stub_cb).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub_cb, perms).unwrap();
         let fake_bin = tmp.path().join("agorabus");
         std::fs::write(&fake_bin, "").unwrap();
 

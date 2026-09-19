@@ -17,6 +17,9 @@
     clippy::single_match_else,
     // pedantic: BTreeMap::default() vs Default::default() is purely stylistic.
     clippy::default_trait_access,
+    // restriction: no logger is wired up yet; eprintln! is the established
+    // best-effort diagnostic path for startup/shutdown flush failures.
+    clippy::print_stderr,
 )]
 
 use crate::persist::{DurableState, StickyIntent, default_state_path, load as load_state, save as save_state};
@@ -108,7 +111,7 @@ struct BusState {
 }
 
 impl BusState {
-    /// Construct from a rehydrated [`DurableState`]. Peers and peer_owners
+    /// Construct from a rehydrated [`DurableState`]. Peers and `peer_owners`
     /// start empty — they are populated as peers re-announce after restart.
     fn from_durable(durable: DurableState) -> Self {
         Self {
@@ -210,20 +213,15 @@ pub async fn run_daemon(
     // Spawn the persist writer as a separate task. It drains pending signals
     // with a debounce window, then writes the current durable state.
     let persist_task = tokio::spawn(async move {
-        loop {
-            match persist_rx.recv().await {
-                Some(()) => {
-                    // Debounce: drain any additional signals that arrive within
-                    // the flush window, then do a single write.
-                    tokio::time::sleep(flush_debounce).await;
-                    while persist_rx.try_recv().is_ok() {}
+        while persist_rx.recv().await.is_some() {
+            // Debounce: drain any additional signals that arrive within
+            // the flush window, then do a single write.
+            tokio::time::sleep(flush_debounce).await;
+            while persist_rx.try_recv().is_ok() {}
 
-                    let durable = state_for_persist.lock().await.to_durable();
-                    if let Err(e) = save_state(&state_file_for_persist, &durable) {
-                        eprintln!("agorabus: state-flush error: {e:#}");
-                    }
-                }
-                None => break, // channel closed → exit
+            let durable = state_for_persist.lock().await.to_durable();
+            if let Err(e) = save_state(&state_file_for_persist, &durable) {
+                eprintln!("agorabus: state-flush error: {e:#}");
             }
         }
     });
@@ -357,7 +355,11 @@ pub async fn run_daemon(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// Cognitive complexity is high by design, same rationale as `handle_line`:
+// this multiplexes client lines, broadcast events, and the drain-notice
+// channel across two select! arms (subscribed vs not), and splitting it
+// obscures that shape.
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 async fn handle_connection(
     stream: UnixStream,
     state: Arc<Mutex<BusState>>,
@@ -605,19 +607,19 @@ where
                     if rec.skill != *s {
                         intent_changed = true;
                     }
-                    rec.skill = s.clone();
+                    rec.skill.clone_from(s);
                 }
                 if let Some(ref p) = prd_slug {
                     if rec.prd_slug != *p {
                         intent_changed = true;
                     }
-                    rec.prd_slug = p.clone();
+                    rec.prd_slug.clone_from(p);
                 }
                 if let Some(ref paths) = working_paths {
                     if rec.working_paths != *paths {
                         intent_changed = true;
                     }
-                    rec.working_paths = paths.clone();
+                    rec.working_paths.clone_from(paths);
                 }
                 // Update the durable intents map to mirror what's in the peer record.
                 if intent_changed {
