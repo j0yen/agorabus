@@ -34,7 +34,7 @@ pub struct DurableState {
     pub intents: HashMap<String, StickyIntent>,
 }
 
-/// Sticky structured intent stored per session_id.
+/// Sticky structured intent stored per `session_id`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StickyIntent {
     /// Skill currently active (e.g. `/build`). Empty string means unset.
@@ -50,7 +50,8 @@ pub struct StickyIntent {
 
 impl StickyIntent {
     /// Returns `true` if all fields are empty (i.e. the intent was cleared).
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.skill.is_empty() && self.prd_slug.is_empty() && self.working_paths.is_empty()
     }
 }
@@ -62,6 +63,9 @@ impl StickyIntent {
 /// # Errors
 ///
 /// Only returns `Err` on unexpected I/O that is not a "not found" condition.
+// restriction: no logger is wired up yet; eprintln! is the established
+// best-effort diagnostic path for a corrupt state file.
+#[allow(clippy::print_stderr)]
 pub fn load(path: &Path) -> Result<DurableState> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<DurableState>(&bytes) {
@@ -90,7 +94,7 @@ pub fn load(path: &Path) -> Result<DurableState> {
 /// Returns an error if the parent directory cannot be created, the temp file
 /// cannot be written or chmod'd, or the rename fails.
 pub fn save(path: &Path, state: &DurableState) -> Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating state dir {}", parent.display()))?;
 

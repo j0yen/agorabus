@@ -106,7 +106,7 @@ impl FleetStore {
         self.entries.remove(&key);
     }
 
-    /// Return all non-stale remote peers, sorted by (node, session_id).
+    /// Return all non-stale remote peers, sorted by (node, `session_id`).
     #[must_use]
     pub fn live_peers(&self) -> Vec<PeerRecord> {
         let now = unix_now();
@@ -157,7 +157,7 @@ pub fn merge_peers(local: Vec<PeerRecord>, remote: Vec<PeerRecord>) -> Vec<PeerR
     merged
 }
 
-/// Compute freshness age in seconds for a remote peer (now − last_heartbeat).
+/// Compute freshness age in seconds for a remote peer (now − `last_heartbeat`).
 #[must_use]
 pub fn peer_age_secs(peer: &PeerRecord) -> u64 {
     unix_now().saturating_sub(peer.last_heartbeat_unix_secs)

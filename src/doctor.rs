@@ -30,6 +30,7 @@ pub enum DoctorFormat {
 
 impl DoctorFormat {
     /// Parse from the CLI `--format` string.
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "text" => Some(Self::Text),
@@ -54,7 +55,7 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    fn as_str(&self) -> &'static str {
+    const fn as_str(&self) -> &'static str {
         match self {
             Self::Current => "current",
             Self::StaleDeletedExe => "stale: deleted-exe",
@@ -115,7 +116,7 @@ pub fn run_doctor(installed_path: Option<&Path>) -> (DoctorReport, ExitCode) {
     let exe_path_raw: Option<String> = read_proc_exe_raw(pid);
     let deleted = exe_path_raw
         .as_deref()
-        .map_or(false, |s| s.ends_with(" (deleted)"));
+        .is_some_and(|s| s.ends_with(" (deleted)"));
 
     // 3. Stat the executing image via /proc/<pid>/exe (the kernel keeps the
     //    inode even for deleted files).
@@ -227,11 +228,11 @@ fn is_agorabus_daemon(pid: u32) -> bool {
     };
     // cmdline is NUL-separated: argv[0]\0argv[1]\0…
     let args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
-    if args.len() < 2 {
+    let (Some(first), Some(second)) = (args.first(), args.get(1)) else {
         return false;
-    }
-    let argv0 = String::from_utf8_lossy(args[0]);
-    let argv1 = String::from_utf8_lossy(args[1]);
+    };
+    let argv0 = String::from_utf8_lossy(first);
+    let argv1 = String::from_utf8_lossy(second);
     // Match "agorabus" (any path suffix) + first arg == "daemon"
     argv0.ends_with("agorabus") && argv1 == "daemon"
 }
@@ -244,14 +245,14 @@ fn read_proc_exe_raw(pid: u32) -> Option<String> {
     let link = format!("/proc/{pid}/exe");
     // We read the kernel-level path via readlink rather than fs::canonicalize
     // so that we preserve the ` (deleted)` suffix.
-    match std::fs::read_link(&link) {
-        Ok(p) => Some(p.to_string_lossy().into_owned()),
-        Err(_) => {
+    std::fs::read_link(&link).map_or_else(
+        |_| {
             // Fall back: read /proc/<pid>/exe as a string (some kernels surface
             // it that way).
             std::fs::read_to_string(&link).ok()
-        }
-    }
+        },
+        |p| Some(p.to_string_lossy().into_owned()),
+    )
 }
 
 /// Return the inode of `path` using `std::fs::metadata`.

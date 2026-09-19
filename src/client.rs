@@ -146,6 +146,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns any error from [`Self::request`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn announce_with_node(
         &mut self,
         session_id: &str,

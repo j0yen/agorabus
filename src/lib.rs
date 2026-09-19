@@ -51,7 +51,8 @@ pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 60;
 /// for subscriber writes to flush before aborting all connections and exiting.
 pub const DEFAULT_DRAIN_GRACE_MS: u64 = 200;
 
-/// Default resume hint in milliseconds embedded in the drain notice
+/// Default resume hint in milliseconds embedded in the drain notice.
+///
 /// (PRD-agorabus-drain-notice). Subscribers are advised to wait at least
 /// this long before reconnecting to avoid a thundering-herd on rebind.
 pub const DEFAULT_DRAIN_RESUME_HINT_MS: u64 = 3_000;
