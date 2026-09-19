@@ -1,8 +1,8 @@
 {
   "schema": "autobuilder.intent_card.v1",
-  "prd_source": "/home/jsy/wintermute/agorabus/PRD-agorabus-nats-uplink.md",
-  "intent_slug": "agorabus-nats-uplink",
-  "root_motivation": "agorabus is per-machine (UDS socket); NATS is the fleet transport (leaf per node \u2192 `nats.service` on hub :7422), but nothing connects them \u2014 the wm-busbridge unit is masked and empty, and no bridge repo exists. Merge them: the agorabus daemon optionally connects to the local NATS leaf and relays topics both ways, so `agorabus publish agent.activity \u2026` on carbon is heard by a subscriber on redbaron with no new binary, no new daemon, and no new secrets (the leaf already holds hub credentials).",
+  "prd_source": "/home/jsy/Documents/PRDs/build-queue/PRD-agorabus-health-main-ci-red-20260918.md",
+  "intent_slug": "agorabus-health-main-ci-red-20260918",
+  "root_motivation": "`scripts/repo-health.sh` computed this repo's health from the journal and `state/ci-status.json` and found the `main-ci-red` invariant true. Non-goal (PRD-build-repo-health-invariants): this PRD does not itself fix the underlying cause \u2014 see that PRD's Non-goals (\"Fixing the causes the alarms point at ... own it\").",
   "user_persona": "Joe Yen running multiple concurrent Claude Code sessions on a single Linux laptop (single-user trust model). The CLI is invoked by SessionStart/Stop hooks and by Claude itself during a session for ad-hoc peer queries.",
   "unfakeable_metric": {
     "name": "acceptance_tests_passing_count",
@@ -14,86 +14,8 @@
     {
       "id": "AC1",
       "level": "MUST",
-      "description": "Given no uplink.toml exists, When the daemon starts and the pre-existing test suite runs, Then behavior matches v0.12.0 and all prior tests pass (uplink off by default).",
+      "description": "Given the evidence below, When the root cause is fixed, Then `repo-health.sh compute` no longer lists `main-ci-red` among `agorabus`'s alarms on the next tick.",
       "test": "tests/acceptance_ac1.rs"
-    },
-    {
-      "id": "AC2",
-      "level": "MUST",
-      "description": "Given an uplink.toml with any subset of enabled/url/node, When the daemon parses it, Then present fields are honored and missing ones take the documented defaults; Given a malformed file, When parsed, Then one error is logged and the daemon falls back to uplink-off rather than crashing.",
-      "test": "tests/acceptance_ac2.rs"
-    },
-    {
-      "id": "AC3",
-      "level": "MUST",
-      "description": "Given uplink enabled and a reachable nats-server, When `agorabus doctor` runs, Then its output includes `uplink: connected` and the url.",
-      "test": "tests/acceptance_ac3.rs"
-    },
-    {
-      "id": "AC4",
-      "level": "MUST",
-      "description": "Given uplink enabled and no nats-server listening, When the daemon starts, Then the local bus serves normally and doctor reports `uplink: reconnecting`; no panic, no exit.",
-      "test": "tests/acceptance_ac4.rs"
-    },
-    {
-      "id": "AC5",
-      "level": "MUST",
-      "description": "Given a connected uplink, When the nats-server stops and later restarts, Then local pub/sub keeps working throughout and the uplink reconnects within 30s (observed via doctor polling in test).",
-      "test": "tests/acceptance_ac5.rs"
-    },
-    {
-      "id": "AC6",
-      "level": "MUST",
-      "description": "Given a connected uplink, When a client publishes on local topic `T`, Then a message arrives on NATS subject `wm.bus.T` wrapped in an envelope containing `origin_node` and the original JSON payload.",
-      "test": "tests/acceptance_ac6.rs"
-    },
-    {
-      "id": "AC7",
-      "level": "MUST",
-      "description": "Given two uplinked daemons A and B on one test nats-server, When a client publishes via A, Then a subscriber attached to B receives the payload exactly once.",
-      "test": "tests/acceptance_ac7.rs"
-    },
-    {
-      "id": "AC8",
-      "level": "MUST",
-      "description": "Given the same two-daemon harness, When A publishes a 10-message burst, Then a subscriber on A receives no uplink echo of A's own messages and B's per-message delivery count stays 1 (no loop amplification).",
-      "test": "tests/acceptance_ac8.rs"
-    },
-    {
-      "id": "AC9",
-      "level": "MUST",
-      "description": "Given both daemons connected, When `agorabus peers` runs on A, Then B's peers appear tagged `node=testb`; When B's daemon is killed, Then those peers disappear within the peer TTL.",
-      "test": "tests/acceptance_ac9.rs"
-    },
-    {
-      "id": "AC10",
-      "level": "SHOULD",
-      "description": "Given remote peers are known, When `agorabus peers --fleet` runs, Then only remote peers are listed; When plain `peers` runs, Then local-peer output is byte-compatible with v0.12.0 apart from the added `node` field.",
-      "test": "tests/acceptance_ac10.rs"
-    },
-    {
-      "id": "AC11",
-      "level": "MUST",
-      "description": "Given any uplink state (disabled, connected, reconnecting), When `agorabus doctor` runs, Then its exit code is unchanged by the uplink state (uplink lines are informational).",
-      "test": "tests/acceptance_ac11.rs"
-    },
-    {
-      "id": "AC12",
-      "level": "SHOULD",
-      "description": "Given `nats-server` is absent from PATH, When the integration tests run, Then they skip with an explicit `skipped: nats-server not on PATH` message instead of passing vacuously; Given it is present, Then the harness spawns a real throwaway server on a random port.",
-      "test": "tests/acceptance_ac12.rs"
-    },
-    {
-      "id": "AC13",
-      "level": "MUST",
-      "description": "Given the finished diff, When `cargo test` and clippy run, Then the version is 0.13.0, the suite is fully green, and clippy is clean on the diff.",
-      "test": "tests/acceptance_ac13.rs"
-    },
-    {
-      "id": "AC14",
-      "level": "SHOULD",
-      "description": "Given the finished build, When the README is read, Then it documents uplink.toml, the `wm.bus.<topic>` subject scheme, the envelope, and the leaf-owns-credentials model.",
-      "test": "tests/acceptance_ac14.rs"
     }
   ],
   "scope": [
