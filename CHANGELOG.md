@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.13.1 — 2026-09-19
+
+Fix main-ci-red: clear cargo clippy lint debt in daemon.rs/client.rs and a rustls advisory (PRD-agorabus-health-main-ci-red-20260918).
+
 ## v0.13.0 — 2026-09-06
 
 Add an optional NATS uplink so agorabus's local pub/sub bus reaches every fleet node through the existing nats-leaf → hub topology (PRD-agorabus-nats-uplink). The never-built wm-busbridge idea retires in favor of this.
