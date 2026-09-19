@@ -1,0 +1,55 @@
+//! Regression test carried over from the original scaffold's AC1 (before
+//! PRD-agorabus-health-main-ci-red-20260918 repointed the intent-card's AC1
+//! at the audit gate — see tests/acceptance_ac1.rs). Kept here, unmodified
+//! in behavior, so this coverage isn't lost even though it no longer maps to
+//! a numbered AC slot.
+//!
+//! `agorabus daemon` starts a UDS server at ~/.cache/agorabus/sock (or path
+//! from --socket), creates parent dirs with 0700, sets the socket file mode
+//! to 0600, and accepts at least one client connection.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown, clippy::indexing_slicing, clippy::cast_lossless, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_panics_doc, clippy::many_single_char_names, clippy::as_conversions, clippy::panic, clippy::needless_pass_by_value, clippy::similar_names, clippy::tests_outside_test_module, clippy::needless_borrow)]
+
+mod common;
+
+use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
+
+use agorabus::Client;
+use common::DaemonHandle;
+
+#[test]
+fn daemon_socket_permissions_and_connect() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let h = DaemonHandle::start_with_timeout(Duration::from_secs(60)).await;
+
+        // (a) Socket file exists.
+        let meta = std::fs::metadata(&h.socket).expect("socket file exists");
+
+        // (b) Socket file mode is 0600.
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket file mode = {mode:o}, want 0600");
+
+        // (c) Parent directory has mode 0700.
+        let parent = h.socket.parent().expect("socket has parent");
+        let pmeta = std::fs::metadata(parent).expect("parent metadata");
+        let pmode = pmeta.permissions().mode() & 0o777;
+        assert_eq!(pmode, 0o700, "parent dir mode = {pmode:o}, want 0700");
+
+        // (d) Daemon accepts a connection.
+        let mut client = Client::connect(&h.socket).await.expect("client connect");
+
+        // (e) Daemon responds to a valid announce.
+        let reply = client
+            .announce("ac1-session", 12345, "/tmp/ac1", "")
+            .await
+            .expect("announce ok");
+        assert!(reply.ok, "announce reply ok=false: {:?}", reply.error);
+
+        h.shutdown().await;
+    });
+}
