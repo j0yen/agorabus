@@ -1,0 +1,15 @@
+# .buildloop/ci-equivalent.toml — agorabus's CI-equivalent declaration
+# for scripts/main-push-gate.sh (PRD-build-main-push-gate requirement 7).
+# Added by PRD-agorabus-health-main-ci-red-20260918: main-push-gate.sh
+# refuses every push to this repo's main (rc 5, "unknown") when this file
+# is missing — discovered live while landing this PRD's own clippy fix,
+# same pattern as autobuilder's ci-equivalent.toml (PRD-autobuilder-
+# reviewer-intent-card-sha).
+#
+# [default].command mirrors .github/workflows/ci.yml's own steps (check,
+# strict clippy, workspace test) without cargo-deny or the bad-rust audit
+# — those already run as part of the extend-gate 25-receipt gate that
+# runs AFTER this check, at the push+gate step. This file's job is a
+# fast pre-push smoke, not a duplicate of the full gate.
+[default]
+command = "cargo check --workspace && cargo clippy --workspace -- -D warnings && cargo test --workspace"
