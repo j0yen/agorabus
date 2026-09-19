@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn peer_record_node_defaults_to_none() {
         let json = r#"{"session_id":"s1","pid":1,"cwd":"/","last_heartbeat_unix_secs":0}"#;
-        let rec: PeerRecord = serde_json::from_str(json).unwrap();
+        let rec: PeerRecord = serde_json::from_str(json).unwrap(); // allowlist: test fixture literal, not external input
         assert_eq!(rec.node, None);
     }
 
@@ -368,7 +368,7 @@ mod tests {
     fn announce_node_field_optional() {
         use crate::protocol::ClientMessage;
         let json = r#"{"op":"announce","session_id":"s1","pid":1,"cwd":"/"}"#;
-        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        let msg: ClientMessage = serde_json::from_str(json).unwrap(); // allowlist: test fixture literal, not external input
         let ClientMessage::Announce { node, .. } = msg else {
             panic!("expected Announce");
         };
@@ -380,7 +380,7 @@ mod tests {
     fn announce_node_field_accepted() {
         use crate::protocol::ClientMessage;
         let json = r#"{"op":"announce","session_id":"s1","pid":1,"cwd":"/","node":"worknode"}"#;
-        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        let msg: ClientMessage = serde_json::from_str(json).unwrap(); // allowlist: test fixture literal, not external input
         let ClientMessage::Announce { node, .. } = msg else {
             panic!("expected Announce");
         };

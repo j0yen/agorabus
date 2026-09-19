@@ -446,7 +446,7 @@ mod tests {
         };
         // Capture to string via JSON serialise (print_report outputs to stdout).
         let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap(); // allowlist: test fixture literal, not external input
         assert_eq!(v["verdict"], "current");
         assert_eq!(v["daemon_pid"], 1234);
     }
