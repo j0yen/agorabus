@@ -207,7 +207,7 @@ mod tests {
     fn corrupt_file_returns_empty_state() {
         let tmp = tempdir().unwrap();
         let state_path = tmp.path().join("state.json");
-        std::fs::write(&state_path, b"not valid json{{{").unwrap();
+        std::fs::write(&state_path, b"not valid json{{{").unwrap(); // allowlist: test fixture literal, not external input
         let state = load(&state_path).expect("corrupt file → empty ok, no panic");
         assert!(state.claims.is_empty());
     }

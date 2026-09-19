@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn partial_file_honors_present_fields() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "enabled = true\n").unwrap();
+        std::fs::write(tmp.path(), "enabled = true\n").unwrap(); // allowlist: test fixture literal, not external input
         let cfg = load_uplink_config(tmp.path());
         assert!(cfg.enabled);
         assert_eq!(cfg.url, DEFAULT_UPLINK_URL, "url should take default");
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn malformed_file_falls_back_to_disabled() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "this is not valid toml {{{").unwrap();
+        std::fs::write(tmp.path(), "this is not valid toml {{{").unwrap(); // allowlist: test fixture literal, not external input
         let cfg = load_uplink_config(tmp.path());
         assert!(!cfg.enabled, "malformed config must disable uplink, not panic");
     }
@@ -389,7 +389,7 @@ mod tests {
             data: serde_json::json!({"hello": "world"}),
         };
         let bytes = serde_json::to_vec(&env).unwrap();
-        let back: Envelope = serde_json::from_slice(&bytes).unwrap();
+        let back: Envelope = serde_json::from_slice(&bytes).unwrap(); // allowlist: test fixture literal, not external input
         assert_eq!(back.origin_node, "testa");
         assert_eq!(back.data, serde_json::json!({"hello": "world"}));
     }

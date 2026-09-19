@@ -843,7 +843,7 @@ mod tests {
         };
         // Capture via JSON serialise.
         let s = serde_json::to_string(&v).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap(); // allowlist: test fixture literal, not external input
         assert_eq!(parsed["status"], "reloaded");
     }
 
@@ -882,11 +882,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Create a stub cloudbuild.sh so resolve_cloudbuild_path succeeds.
         let stub_cb = tmp.path().join("cloudbuild.sh");
-        std::fs::write(&stub_cb, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&stub_cb, "#!/bin/sh\nexit 0\n").unwrap(); // allowlist: test fixture literal, not external input
 
         // Use a fake installed_path so resolve_install_dest is deterministic.
         let fake_bin = tmp.path().join("agorabus");
-        std::fs::write(&fake_bin, "").unwrap();
+        std::fs::write(&fake_bin, "").unwrap(); // allowlist: test fixture literal, not external input
 
         let cfg = ReloadConfig {
             socket_path: tmp.path().join("sock"),
@@ -930,7 +930,7 @@ mod tests {
         let missing_cb = tmp.path().join("does-not-exist.sh");
 
         let fake_bin = tmp.path().join("agorabus");
-        std::fs::write(&fake_bin, "").unwrap();
+        std::fs::write(&fake_bin, "").unwrap(); // allowlist: test fixture literal, not external input
 
         let cfg = ReloadConfig {
             socket_path: tmp.path().join("sock"),
@@ -982,7 +982,7 @@ mod tests {
             artifact_path.display()
         );
         let stub_cb = tmp.path().join("cloudbuild.sh");
-        std::fs::write(&stub_cb, &stub_content).unwrap();
+        std::fs::write(&stub_cb, &stub_content).unwrap(); // allowlist: test fixture literal, not external input
         // Make stub executable.
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(&stub_cb).unwrap().permissions();
@@ -991,8 +991,7 @@ mod tests {
 
         // Override HOME so locate_cloudbuild_artifact finds the artifact.
         let home_backup = std::env::var_os("HOME");
-        // SAFETY: test-only env manipulation; no other threads share HOME in
-        // this single-threaded test (lib tests run with default single-thread).
+        // SAFETY: test-only env manipulation; single-threaded test, no concurrent HOME readers.
         unsafe { std::env::set_var("HOME", tmp.path()); }
 
         let install_dest = tmp.path().join("bin/agorabus");
@@ -1002,8 +1001,14 @@ mod tests {
 
         // Restore HOME.
         match home_backup {
-            Some(v) => unsafe { std::env::set_var("HOME", v); },
-            None => unsafe { std::env::remove_var("HOME"); },
+            Some(v) => {
+                // SAFETY: test-only env manipulation; single-threaded test, no concurrent HOME readers.
+                unsafe { std::env::set_var("HOME", v); }
+            }
+            None => {
+                // SAFETY: test-only env manipulation; single-threaded test, no concurrent HOME readers.
+                unsafe { std::env::remove_var("HOME"); }
+            }
         }
 
         assert!(result.is_ok(), "cloudbuild+install should succeed with stub: {:?}", result);
@@ -1025,14 +1030,14 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let stub_cb = tmp.path().join("cloudbuild.sh");
-        std::fs::write(&stub_cb, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&stub_cb, "#!/bin/sh\nexit 0\n").unwrap(); // allowlist: test fixture literal, not external input
         // Make stub executable.
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(&stub_cb).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&stub_cb, perms).unwrap();
         let fake_bin = tmp.path().join("agorabus");
-        std::fs::write(&fake_bin, "").unwrap();
+        std::fs::write(&fake_bin, "").unwrap(); // allowlist: test fixture literal, not external input
 
         let cfg = ReloadConfig {
             socket_path: tmp.path().join("sock"),
@@ -1085,8 +1090,14 @@ mod tests {
         unsafe { std::env::set_var(AGORABUS_CLOUDBUILD_ENV, "/from/env/cloudbuild.sh"); }
         let result = resolve_cloudbuild_path(None).unwrap();
         match old {
-            Some(v) => unsafe { std::env::set_var(AGORABUS_CLOUDBUILD_ENV, v); },
-            None => unsafe { std::env::remove_var(AGORABUS_CLOUDBUILD_ENV); },
+            Some(v) => {
+                // SAFETY: single-threaded test; no other threads read this env var concurrently.
+                unsafe { std::env::set_var(AGORABUS_CLOUDBUILD_ENV, v); }
+            }
+            None => {
+                // SAFETY: single-threaded test; no other threads read this env var concurrently.
+                unsafe { std::env::remove_var(AGORABUS_CLOUDBUILD_ENV); }
+            }
         }
         assert_eq!(result, PathBuf::from("/from/env/cloudbuild.sh"));
     }
