@@ -1015,6 +1015,14 @@ mod tests {
     /// skips both rebuild and bounce (no-op).
     #[tokio::test]
     async fn build_noop_when_already_current() {
+        // A live `agorabus daemon` on the test host (e.g. a real dev/build
+        // box) makes doctor::run_doctor find a daemon_pid unrelated to this
+        // test's fake_bin, driving the function into the real --build path
+        // below instead of the no-daemon path this test exercises. Same
+        // guard as doctor::tests::run_doctor_no_daemon_exits_2.
+        if doctor::run_doctor(None).0.daemon_pid.is_some() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let stub_cb = tmp.path().join("cloudbuild.sh");
         std::fs::write(&stub_cb, "#!/bin/sh\nexit 0\n").unwrap();
