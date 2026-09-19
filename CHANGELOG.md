@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.13.2 — 2026-09-19
+
+Fix main-ci-red: clear 16 blocking bad-rust-audit findings (unsafe blocks missing a directly-preceding SAFETY: comment, and .unwrap() on test-fixture literals misclassified as external-input) so the autobuilder gate's bad-rust audit step passes on main (PRD-agorabus-health-main-ci-red-20260918).
+
 ## v0.13.1 — 2026-09-19
 
 Fix main-ci-red: clear cargo clippy lint debt in daemon.rs/client.rs and a rustls advisory (PRD-agorabus-health-main-ci-red-20260918).
