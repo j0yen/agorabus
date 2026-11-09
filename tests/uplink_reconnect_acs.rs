@@ -2,6 +2,7 @@
 //! working throughout a leaf outage, and the uplink reconnects within 30s
 //! of the leaf coming back.
 
+#![allow(clippy::panic)] // test code: a failing unwrap/index/panic is the intended failure signal
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -87,9 +88,7 @@ async fn wait_for(
         if pred(&status) {
             return;
         }
-        if Instant::now() >= deadline {
-            panic!("uplink status never matched predicate within {timeout_secs}s: {status:?}");
-        }
+        assert!(Instant::now() < deadline, "uplink status never matched predicate within {timeout_secs}s: {status:?}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

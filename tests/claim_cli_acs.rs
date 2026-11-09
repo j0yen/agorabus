@@ -1,9 +1,10 @@
 //! Acceptance tests for PRD-chord-claim ACs 8-9: CLI-level surface.
 //!
 //! AC8 (fail-open with no daemon) and AC9 (--wait flag, client-side) both
-//! exercise the binary's run_claim path, not just the daemon. Spawn the
-//! binary via CARGO_BIN_EXE_agorabus and observe stdout + exit code.
+//! exercise the binary's `run_claim` path, not just the daemon. Spawn the
+//! binary via `CARGO_BIN_EXE_agorabus` and observe stdout + exit code.
 
+#![allow(clippy::panic)] // test code: a failing unwrap/index/panic is the intended failure signal
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -102,6 +103,7 @@ fn claim_ac8_failopen_no_daemon() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one sequential scenario; splitting it would change test meaning
 fn claim_ac9_wait_either_succeeds_or_times_out() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -132,7 +134,7 @@ fn claim_ac9_wait_either_succeeds_or_times_out() {
             ])
             .output()
             .expect("spawn A acquire");
-        assert!(out.status.success(), "sid-A acquire failed: {:?}", out);
+        assert!(out.status.success(), "sid-A acquire failed: {out:?}");
 
         // sid-B tries acquire with --wait 2; sid-A doesn't release.
         // Expectation: command exits non-zero (claim_conflict) with timed_out:true
@@ -166,7 +168,7 @@ fn claim_ac9_wait_either_succeeds_or_times_out() {
         let reply: serde_json::Value = serde_json::from_str(stdout.trim())
             .unwrap_or_else(|e| panic!("parse JSON reply: {e}; stdout={stdout:?}"));
         assert_eq!(
-            reply.get("ok").and_then(|v| v.as_bool()),
+            reply.get("ok").and_then(serde_json::Value::as_bool),
             Some(false),
             "ok=false expected, reply={reply}"
         );
@@ -177,7 +179,7 @@ fn claim_ac9_wait_either_succeeds_or_times_out() {
         let timed_out = reply
             .get("data")
             .and_then(|d| d.get("timed_out"))
-            .and_then(|v| v.as_bool());
+            .and_then(serde_json::Value::as_bool);
         assert_eq!(
             timed_out,
             Some(true),
@@ -206,7 +208,7 @@ fn claim_ac9_wait_either_succeeds_or_times_out() {
             ])
             .output()
             .expect("re-acquire A");
-        assert!(out.status.success(), "renew failed: {:?}", out);
+        assert!(out.status.success(), "renew failed: {out:?}");
         let _ = ttl_unix; // documents intent; daemon picks its own from --ttl
 
         // Spawn sid-B's --wait 5 in the background, then release A after 500ms.
@@ -244,7 +246,7 @@ fn claim_ac9_wait_either_succeeds_or_times_out() {
             ])
             .output()
             .expect("release A");
-        assert!(out.status.success(), "A release failed: {:?}", out);
+        assert!(out.status.success(), "A release failed: {out:?}");
 
         let b_out = b_handle.join().expect("B thread join");
         assert!(
@@ -256,7 +258,7 @@ fn claim_ac9_wait_either_succeeds_or_times_out() {
         let b_stdout = String::from_utf8_lossy(&b_out.stdout);
         let b_reply: serde_json::Value = serde_json::from_str(b_stdout.trim())
             .unwrap_or_else(|e| panic!("parse B reply: {e}; stdout={b_stdout:?}"));
-        assert_eq!(b_reply.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(b_reply.get("ok").and_then(serde_json::Value::as_bool), Some(true));
 
         h.shutdown().await;
     });

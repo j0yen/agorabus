@@ -1,8 +1,9 @@
 //! Acceptance tests for tether-presence fleet peer extension.
 //!
-//! Tests use the existing in-process UDS harness (DaemonHandle) and the
-//! pure-Rust FleetStore / merge_peers logic. No external NATS required.
+//! Tests use the existing in-process UDS harness (`DaemonHandle`) and the
+//! pure-Rust `FleetStore` / `merge_peers` logic. No external NATS required.
 
+#![allow(clippy::indexing_slicing)] // test code: a failing unwrap/index/panic is the intended failure signal
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -17,6 +18,7 @@ use agorabus::{
     protocol::{FLEET_PRESENCE_SUBJECT_ANNOUNCE, FLEET_PRESENCE_SUBJECT_GONE},
 };
 use common::DaemonHandle;
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn unix_now() -> u64 {
@@ -94,7 +96,7 @@ fn ac2_announce_with_node_is_tagged() {
     });
 }
 
-/// AC3: merge_peers with empty remote list is byte-equivalent to local-only.
+/// AC3: `merge_peers` with empty remote list is byte-equivalent to local-only.
 #[test]
 fn ac3_no_fleet_returns_local_only() {
     let local = vec![agorabus::PeerRecord {
@@ -108,7 +110,7 @@ fn ac3_no_fleet_returns_local_only() {
         working_paths: Vec::new(),
         last_heartbeat_unix_secs: unix_now(),
         node: None,
-        extra: Default::default(),
+        extra: BTreeMap::default(),
     }];
     let merged = merge_peers(local.clone(), Vec::new());
     // Output should be identical: same len, same node=None.
@@ -150,7 +152,7 @@ fn ac4_fleet_merge_and_dedup() {
         working_paths: Vec::new(),
         last_heartbeat_unix_secs: unix_now(),
         node: None,
-        extra: Default::default(),
+        extra: BTreeMap::default(),
     };
     let merged = merge_peers(vec![local_peer], remote_peers);
     assert_eq!(merged.len(), 2, "local + one remote");
@@ -160,7 +162,7 @@ fn ac4_fleet_merge_and_dedup() {
     assert_eq!(rp.pid, 1234);
 }
 
-/// AC4b: peer_age_secs returns a reasonable freshness age.
+/// `AC4b`: `peer_age_secs` returns a reasonable freshness age.
 #[test]
 fn ac4b_peer_freshness_age() {
     let ts = unix_now().saturating_sub(5); // 5 seconds ago
@@ -175,11 +177,11 @@ fn ac4b_peer_freshness_age() {
         working_paths: Vec::new(),
         last_heartbeat_unix_secs: ts,
         node: Some("n".to_string()),
-        extra: Default::default(),
+        extra: BTreeMap::default(),
     };
     let age = peer_age_secs(&peer);
     // Allow ±2s for clock jitter.
-    assert!(age >= 3 && age <= 10, "expected ~5s age, got {age}");
+    assert!((3..=10).contains(&age), "expected ~5s age, got {age}");
 }
 
 /// AC5: a fleet presence event injected via publish is received exactly once.

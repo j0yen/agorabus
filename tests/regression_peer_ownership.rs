@@ -1,7 +1,7 @@
 //! Regression test: a one-shot client that reuses an existing long-lived
-//! peer's session_id must not wipe the long-lived peer's record on
-//! disconnect. The daemon tracks owner-connection per session_id; a guest
-//! announce that hits an already-owned session_id is allowed (so publish
+//! peer's `session_id` must not wipe the long-lived peer's record on
+//! disconnect. The daemon tracks owner-connection per `session_id`; a guest
+//! announce that hits an already-owned `session_id` is allowed (so publish
 //! and heartbeat over that connection still work) but does NOT take
 //! ownership and therefore does not remove the record on close.
 //!

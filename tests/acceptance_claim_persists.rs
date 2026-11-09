@@ -17,7 +17,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agorabus::{
@@ -34,7 +33,7 @@ fn now_unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-async fn announce(socket: &PathBuf, sid: &str) -> Client {
+async fn announce(socket: &std::path::Path, sid: &str) -> Client {
     let mut c = Client::connect(socket).await.expect("connect");
     let r = c
         .announce(sid, std::process::id(), "/tmp", "persist-test")
@@ -80,7 +79,7 @@ fn ac1_claims_survive_restart() {
             .claim_acquire("/tmp/ac1-target", ttl_unix, "ac1", false)
             .await
             .unwrap();
-        assert!(r.ok, "acquire failed: {:?}", r);
+        assert!(r.ok, "acquire failed: {r:?}");
 
         // Allow debounce window to flush.
         tokio::time::sleep(Duration::from_millis(DEFAULT_STATE_FLUSH_MS + 100)).await;
@@ -153,7 +152,7 @@ fn ac2_expired_claims_not_resurrected() {
             .claim_acquire("/tmp/ac2-expiry", ttl_unix, "ac2", false)
             .await
             .unwrap();
-        assert!(r.ok, "acquire failed: {:?}", r);
+        assert!(r.ok, "acquire failed: {r:?}");
 
         // Wait for both the claim to expire and the flush debounce to elapse.
         tokio::time::sleep(Duration::from_millis(DEFAULT_STATE_FLUSH_MS + 1500)).await;
@@ -229,7 +228,7 @@ fn ac3_sticky_intent_survives_restart() {
             )
             .await
             .unwrap();
-        assert!(r.ok, "heartbeat_with_intent failed: {:?}", r);
+        assert!(r.ok, "heartbeat_with_intent failed: {r:?}");
 
         tokio::time::sleep(Duration::from_millis(DEFAULT_STATE_FLUSH_MS + 100)).await;
 
@@ -303,7 +302,7 @@ fn ac4_atomic_write_mode_0600() {
         // No .tmp residue.
         let residue: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(residue.is_empty(), "tmp residue found: {residue:?}");

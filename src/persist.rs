@@ -147,6 +147,7 @@ pub fn default_state_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // test module: a failing unwrap/index/panic is the intended failure signal
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
     use tempfile::tempdir;
@@ -228,7 +229,7 @@ mod tests {
         // No .tmp file should remain.
         let tmp_residue: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()

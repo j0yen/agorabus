@@ -273,6 +273,7 @@ where
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)] // test module: a failing unwrap/index/panic is the intended failure signal
     use super::*;
 
     /// AC3 — backoff shape: `min(cap, base * 2^n)` must hold for each attempt.
@@ -298,8 +299,8 @@ mod tests {
         assert_eq!(expected_windows[2], 200);
         assert_eq!(expected_windows[3], 400);
         // Cap is reached and stays.
-        for i in 4..8 {
-            assert_eq!(expected_windows[i], 400, "attempt {i} should be capped at 400");
+        for (i, w) in expected_windows.iter().enumerate().take(8).skip(4) {
+            assert_eq!(*w, 400, "attempt {i} should be capped at 400");
         }
     }
 
@@ -319,7 +320,7 @@ mod tests {
             for _ in 0..20 {
                 let d = backoff_delay(base, cap, attempt);
                 assert!(
-                    d.as_millis() < window as u128 || window == 0,
+                    d.as_millis() < u128::from(window) || window == 0,
                     "attempt={attempt}: delay {}ms exceeded window {window}ms",
                     d.as_millis()
                 );

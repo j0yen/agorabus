@@ -19,6 +19,7 @@
 //! The reconnect mechanism itself (a subscriber re-registering after a daemon
 //! bounce) is proven end-to-end by `acceptance_reconnect_survives_restart.rs`.
 
+#![allow(clippy::indexing_slicing)] // test code: a failing unwrap/index/panic is the intended failure signal
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -33,8 +34,8 @@ use std::collections::HashSet;
 /// Helper: compute the verdict fields from peers_before + peers_after,
 /// mirroring the logic in `reload::run_reload`.
 fn compute_verdict(
-    peers_before: Vec<String>,
-    peers_after: Vec<String>,
+    peers_before: &[String],
+    peers_after: &[String],
 ) -> (Vec<String>, Vec<String>, ReloadStatus) {
     let before_set: HashSet<String> = peers_before.iter().cloned().collect();
     let after_set: HashSet<String> = peers_after.iter().cloned().collect();
@@ -67,7 +68,7 @@ fn ac2_peers_recovered_contains_pre_bounce_session_id() {
     let peers_after = vec![session_id.clone()]; // subscriber reconnected
 
     let (peers_recovered, peers_missing, status) =
-        compute_verdict(peers_before.clone(), peers_after.clone());
+        compute_verdict(&peers_before, &peers_after);
 
     assert!(
         peers_recovered.contains(&session_id),
@@ -95,7 +96,7 @@ fn ac2_verdict_recovered_and_missing_split_is_correct() {
     let peers_after = vec![s1.clone()]; // s2 did not reconnect
 
     let (peers_recovered, peers_missing, status) =
-        compute_verdict(peers_before, peers_after);
+        compute_verdict(&peers_before, &peers_after);
 
     assert!(
         peers_recovered.contains(&s1),

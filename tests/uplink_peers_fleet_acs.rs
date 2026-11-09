@@ -33,9 +33,7 @@ async fn wait_connected(socket: &std::path::Path, sid: &str) {
         if matches!(status, UplinkStatus::Connected { .. }) {
             return;
         }
-        if Instant::now() >= deadline {
-            panic!("uplink never reported connected for {sid}: {status:?}");
-        }
+        assert!(Instant::now() < deadline, "uplink never reported connected for {sid}: {status:?}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -88,9 +86,7 @@ fn ac9_remote_peer_visible_then_expires_after_daemon_dies() {
             if remote.iter().any(|p| p.node.as_deref() == Some("testb")) {
                 break;
             }
-            if Instant::now() >= deadline {
-                panic!("B's peer never showed up in A's --fleet view");
-            }
+            assert!(Instant::now() < deadline, "B's peer never showed up in A's --fleet view");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 

@@ -39,7 +39,7 @@ use agorabus::{
     reload::{ReloadConfig, ReloadFormat, print_verdict, run_reload},
 };
 use tokio::time::{Instant, timeout};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -356,15 +356,21 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             };
             let (_ready_tx, _ready_rx) = tokio::sync::oneshot::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let daemon = tokio::spawn(async move { run_daemon(cfg, None, shutdown_rx).await });
+            let mut daemon = tokio::spawn(async move { run_daemon(cfg, None, shutdown_rx).await });
 
-            // Wait for SIGINT / SIGTERM, then signal shutdown.
+            // Wait for SIGINT / SIGTERM, then signal shutdown. A daemon that
+            // returns first never bound: Ok = another owner already serves
+            // the socket (exit 0), Err = refused or failed to bind (exit 2).
             use tokio::signal::unix::{SignalKind, signal};
             let mut sigint = signal(SignalKind::interrupt())?;
             let mut sigterm = signal(SignalKind::terminate())?;
             tokio::select! {
                 _ = sigint.recv() => {}
                 _ = sigterm.recv() => {}
+                early = &mut daemon => {
+                    early.context("daemon task")??;
+                    return Ok(ExitCode::SUCCESS);
+                }
             }
             let _ = shutdown_tx.send(());
             let _ = daemon.await;

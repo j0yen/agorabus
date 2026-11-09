@@ -13,6 +13,7 @@
 //! AC6 — no daemon → clear refusal: without `--start-if-absent`, reload
 //!   returns a `failed` verdict and a nonzero exit code.
 
+#![allow(clippy::indexing_slicing)] // test code: a failing unwrap/index/panic is the intended failure signal
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
