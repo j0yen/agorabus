@@ -952,10 +952,7 @@ pub(crate) fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::F
     let meta = file
         .metadata()
         .with_context(|| format!("stat owner lock {}", lock_path.display()))?;
-    // `/proc/self` is owned by the process's effective uid.
-    let me = std::fs::metadata("/proc/self")
-        .context("stat /proc/self")?
-        .uid();
+    let me = rustix::process::geteuid().as_raw();
     if meta.uid() == me {
         rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
             .map_err(std::io::Error::from)

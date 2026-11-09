@@ -291,6 +291,11 @@ fn c_lock_never_released_does_not_launch() {
         },
     )
     .unwrap();
+    // Track a wrongly launched daemon before asserting, so a failure here
+    // does not leak it.
+    if let Bounce::Launched(new) = out {
+        pids.track(new);
+    }
     assert_eq!(out, Bounce::LockHeld);
     wait_dead(old);
 

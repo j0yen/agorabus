@@ -184,7 +184,7 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
     };
 
     // ── 1. Pre-flight: find daemon pid ────────────────────────────────────────
-    let (doctor_report, _doctor_code) = doctor::run_doctor(cfg.installed_path.as_deref());
+    let (doctor_report, _doctor_code) = doctor::run_doctor_for_socket(cfg.installed_path.as_deref(), &cfg.socket_path);
 
     let daemon_pid = doctor_report.daemon_pid;
 
@@ -291,9 +291,42 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
     }
 
     // ── 4. Drain + bounce ─────────────────────────────────────────────────────
+    // A reload that did not take: the daemon (if any) is not replaced.
+    let failed = |old_pid: Option<u32>, new_pid: Option<u32>, peers: Vec<String>| ReloadVerdict {
+        old_pid,
+        new_pid,
+        binary_before: binary_before.clone(),
+        binary_after: None,
+        peers_before: peers,
+        peers_after: vec![],
+        peers_recovered: vec![],
+        peers_missing: vec![],
+        elapsed_ms: elapsed_ms(start),
+        status: ReloadStatus::Failed,
+        build_command: build_command.clone(),
+        install_dest: install_dest.clone(),
+        build_skipped: if cfg.build { Some(false) } else { None },
+    };
+    let reconnect_deadline = Instant::now() + Duration::from_millis(cfg.reconnect_timeout_ms);
+
     let Some(old_pid) = daemon_pid else {
-        // start_if_absent path: no existing daemon; just launch one.
-        let new_pid = launch_daemon(&discover_binary()?, &cfg.socket_path, &[])?;
+        // start_if_absent path: no discovered daemon. An owner lock held by an
+        // undiscovered owner must not be launched into.
+        let Bounce::Launched(new_pid) = start_daemon_if_lock_free(
+            &cfg.socket_path,
+            OWNER_LOCK_EXTRA_WAIT,
+            &discover_binary()?,
+            &[],
+        ) else {
+            return Ok((failed(None, None, vec![]), ExitCode::from(1)));
+        };
+        if !wait_until_answers(&cfg.socket_path, reconnect_deadline).await {
+            eprintln!(
+                "agorabus reload: new daemon (pid {new_pid}) did not answer on {}",
+                cfg.socket_path.display()
+            );
+            return Ok((failed(None, Some(new_pid), vec![]), ExitCode::from(1)));
+        }
         let verdict = ReloadVerdict {
             old_pid: None,
             new_pid: Some(new_pid),
@@ -327,28 +360,13 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
         },
     )? {
         Bounce::Launched(pid) => pid,
-        Bounce::LockHeld => {
-            let verdict = ReloadVerdict {
-                old_pid: Some(old_pid),
-                new_pid: None,
-                binary_before,
-                binary_after: None,
-                peers_before,
-                peers_after: vec![],
-                peers_recovered: vec![],
-                peers_missing: vec![],
-                elapsed_ms: elapsed_ms(start),
-                status: ReloadStatus::Failed,
-                build_command,
-                install_dest,
-                build_skipped: if cfg.build { Some(false) } else { None },
-            };
-            return Ok((verdict, ExitCode::from(1)));
+        Bounce::LockHeld | Bounce::ProbeFailed => {
+            return Ok((failed(Some(old_pid), None, peers_before), ExitCode::from(1)));
         }
     };
 
     // ── 5. Confirm: poll socket + peers ──────────────────────────────────────
-    let deadline = Instant::now() + Duration::from_millis(cfg.reconnect_timeout_ms);
+    let deadline = reconnect_deadline;
 
     // Wait for socket to appear.
     while !cfg.socket_path.exists() {
@@ -384,7 +402,19 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
         .collect();
     peers_missing.sort_unstable();
 
-    let status = if peers_missing.is_empty() {
+    // With no pre-bounce peers the poll above ends at once; the new daemon
+    // must still have bound its socket and answer on it.
+    let answered = wait_until_answers(&cfg.socket_path, deadline).await;
+    if !answered {
+        eprintln!(
+            "agorabus reload: new daemon (pid {new_pid}) did not answer on {}",
+            cfg.socket_path.display()
+        );
+    }
+
+    let status = if !answered {
+        ReloadStatus::Failed
+    } else if peers_missing.is_empty() {
         ReloadStatus::Reloaded
     } else {
         ReloadStatus::ReloadedDegraded
@@ -398,7 +428,7 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
     // Post-bounce doctor check (best-effort; don't fail the reload if /proc
     // introspection is flaky).
     let binary_after = {
-        let (post_report, _) = doctor::run_doctor(cfg.installed_path.as_deref());
+        let (post_report, _) = doctor::run_doctor_for_socket(cfg.installed_path.as_deref(), &cfg.socket_path);
         match post_report.verdict {
             Verdict::Current => Some("current".to_string()),
             Verdict::StaleDeletedExe => Some("stale:deleted-exe".to_string()),
@@ -624,6 +654,52 @@ fn set_executable(path: &Path) -> Result<()> {
 /// Collect the current set of session IDs from the daemon's peers endpoint.
 /// Returns an empty vec on any error (fail-open).
 async fn snapshot_peers(socket: &Path) -> Result<Vec<String>> {
+    snapshot_peers_within(socket, SNAPSHOT_TIMEOUT).await
+}
+
+/// How long one peer snapshot may take before it is abandoned.
+pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// [`snapshot_peers`] bounded by `bound`: a peer that accepts the connection
+/// but never answers yields an empty set (fail-open) once the bound passes.
+///
+/// # Errors
+///
+/// Returns `Err` on a connect or protocol error before the bound.
+pub async fn snapshot_peers_within(socket: &Path, bound: Duration) -> Result<Vec<String>> {
+    tokio::time::timeout(bound, snapshot_peers_unbounded(socket))
+        .await
+        .unwrap_or_else(|_| Ok(vec![]))
+}
+
+/// True once something answers an announce on `socket` within `deadline`.
+async fn wait_until_answers(socket: &Path, deadline: Instant) -> bool {
+    loop {
+        let attempt = async {
+            let mut client = Client::try_connect(socket).await.ok().flatten()?;
+            let pid = std::process::id();
+            client
+                .announce(&format!("reload-probe-{pid}"), pid, "", "reload-probe")
+                .await
+                .ok()
+                .map(|r| r.ok)
+        };
+        if tokio::time::timeout(SNAPSHOT_TIMEOUT, attempt)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn snapshot_peers_unbounded(socket: &Path) -> Result<Vec<String>> {
     let Some(mut client) = Client::try_connect(socket).await? else {
         return Ok(vec![]);
     };
@@ -655,6 +731,9 @@ pub enum Bounce {
     Launched(u32),
     /// The owner lock was still held at the bound; nothing was launched.
     LockHeld,
+    /// The owner-lock probe itself failed (reason on stderr); nothing was
+    /// launched.
+    ProbeFailed,
 }
 
 /// Timing and launch settings for [`bounce_daemon`].
@@ -676,12 +755,14 @@ pub struct BounceOpts<'a> {
 /// more for the owner lock on `socket_path` to be free.
 ///
 /// If the lock is still held at the bound, nothing is launched, one line
-/// naming the pid and the lock path goes to stderr, and `Bounce::LockHeld` is
-/// returned; the old daemon is left as it is.
+/// naming the pid, whether it has exited, and the lock path goes to stderr, and
+/// `Bounce::LockHeld` is returned. If the lock probe itself fails (after the
+/// signal was sent) the error goes to stderr and `Bounce::ProbeFailed` is
+/// returned.
 ///
 /// # Errors
 ///
-/// Fails if the signal, the lock probe or the launch fails.
+/// Fails if the signal or the launch fails.
 pub fn bounce_daemon(
     socket_path: &Path,
     old_pid: u32,
@@ -695,28 +776,81 @@ pub fn bounce_daemon(
     } = *opts;
     send_sigterm(old_pid)?;
     let drained = wait_for_exit(old_pid, drain_timeout);
-    if !drained {
-        eprintln!(
-            "agorabus reload: old daemon (pid {old_pid}) did not exit within {}ms; waiting for its owner lock",
-            drain_timeout.as_millis()
-        );
-    }
-    let deadline = Instant::now() + extra_wait;
-    loop {
-        // Probe and release at once: the new daemon takes the lock itself.
-        if daemon::acquire_owner_lock(socket_path)?.is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
+    match wait_owner_lock_free(socket_path, extra_wait) {
+        Ok(true) => {}
+        Ok(false) => {
+            let state = if drained || !Path::new(&format!("/proc/{old_pid}")).exists() {
+                "has exited"
+            } else {
+                "is still running"
+            };
             eprintln!(
-                "agorabus reload: owner lock {} still held (old daemon pid {old_pid}); not launching, old daemon left running",
+                "agorabus reload: owner lock {} still held after SIGTERM to pid {old_pid} (it {state}); not launching",
                 daemon::owner_lock_path(socket_path).display()
             );
             return Ok(Bounce::LockHeld);
         }
-        std::thread::sleep(Duration::from_millis(50));
+        Err(e) => {
+            eprintln!(
+                "agorabus reload: owner lock probe failed after SIGTERM to pid {old_pid}: {e:#}; not launching"
+            );
+            return Ok(Bounce::ProbeFailed);
+        }
     }
     Ok(Bounce::Launched(launch_daemon(binary, socket_path, extra_args)?))
+}
+
+/// Launch a daemon on `socket_path` only if its owner lock is free within
+/// `extra_wait`.
+///
+/// Used when no running daemon was discovered: a lock held by an
+/// undiscovered owner means a new daemon would exit at once.
+///
+/// Returns `Launched(pid)`, or `LockHeld` / `ProbeFailed` (one stderr line)
+/// with nothing launched. A launch failure is reported as `ProbeFailed`.
+#[must_use]
+pub fn start_daemon_if_lock_free(
+    socket_path: &Path,
+    extra_wait: Duration,
+    binary: &Path,
+    extra_args: &[String],
+) -> Bounce {
+    match wait_owner_lock_free(socket_path, extra_wait) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!(
+                "agorabus reload: owner lock {} held by an undiscovered owner; not launching",
+                daemon::owner_lock_path(socket_path).display()
+            );
+            return Bounce::LockHeld;
+        }
+        Err(e) => {
+            eprintln!("agorabus reload: owner lock probe failed: {e:#}; not launching");
+            return Bounce::ProbeFailed;
+        }
+    }
+    match launch_daemon(binary, socket_path, extra_args) {
+        Ok(pid) => Bounce::Launched(pid),
+        Err(e) => {
+            eprintln!("agorabus reload: {e:#}");
+            Bounce::ProbeFailed
+        }
+    }
+}
+
+/// Wait up to `extra_wait` for the owner lock on `socket_path` to be free.
+/// The lock is released again at once: the new daemon takes it itself.
+fn wait_owner_lock_free(socket_path: &Path, extra_wait: Duration) -> Result<bool> {
+    let deadline = Instant::now() + extra_wait;
+    loop {
+        if daemon::acquire_owner_lock(socket_path)?.is_some() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Send SIGTERM to `pid` via the system `kill` utility.
@@ -820,6 +954,7 @@ fn discover_binary() -> Result<PathBuf> {
 )]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn reload_format_parse_text() {
@@ -1046,18 +1181,14 @@ mod tests {
         // Here we assert that the function returns an error OR a Failed verdict
         // without panicking (the daemon is not running in the test env, so the
         // pre-flight check is the gate).
-        match run_reload(&cfg).await {
-            Ok((verdict, _)) => {
-                // The pre-flight daemon-absent check fired first — acceptable.
-                assert!(
-                    verdict.old_pid.is_none() || verdict.status == ReloadStatus::Failed,
-                    "unexpected non-failed verdict: {:?}",
-                    verdict.status
-                );
-            }
-            Err(_) => {
-                // Error is acceptable here (cloudbuild missing, apply mode).
-            }
+        // An Err is acceptable here (cloudbuild missing, apply mode).
+        if let Ok((verdict, _)) = run_reload(&cfg).await {
+            // The pre-flight daemon-absent check fired first — acceptable.
+            assert!(
+                verdict.old_pid.is_none() || verdict.status == ReloadStatus::Failed,
+                "unexpected non-failed verdict: {:?}",
+                verdict.status
+            );
         }
     }
 
@@ -1080,7 +1211,6 @@ mod tests {
         let stub_cb = tmp.path().join("cloudbuild.sh");
         std::fs::write(&stub_cb, &stub_content).unwrap(); // allowlist: test fixture literal, not external input
         // Make stub executable.
-        use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(&stub_cb).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&stub_cb, perms).unwrap();
@@ -1107,7 +1237,7 @@ mod tests {
             }
         }
 
-        assert!(result.is_ok(), "cloudbuild+install should succeed with stub: {:?}", result);
+        assert!(result.is_ok(), "cloudbuild+install should succeed with stub: {result:?}");
         assert!(install_dest.exists(), "installed binary should exist at dest");
         // AC5: no local cargo build in the flow (trivially true for stub path).
     }
@@ -1128,7 +1258,6 @@ mod tests {
         let stub_cb = tmp.path().join("cloudbuild.sh");
         std::fs::write(&stub_cb, "#!/bin/sh\nexit 0\n").unwrap(); // allowlist: test fixture literal, not external input
         // Make stub executable.
-        use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(&stub_cb).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&stub_cb, perms).unwrap();
