@@ -924,7 +924,7 @@ async fn run_fleet_presence_broadcaster(
 }
 
 /// Lock file guarding one socket path: `<socket path>.lock`.
-fn owner_lock_path(socket_path: &Path) -> PathBuf {
+pub(crate) fn owner_lock_path(socket_path: &Path) -> PathBuf {
     let mut name = socket_path.as_os_str().to_owned();
     name.push(".lock");
     PathBuf::from(name)
@@ -937,8 +937,8 @@ fn owner_lock_path(socket_path: &Path) -> PathBuf {
 /// this path). `Err`: the lock could not be opened or taken for any other
 /// reason; the caller fails closed. The lock file itself is never unlinked:
 /// removing it would let two daemons lock two different inodes.
-fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+pub(crate) fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     let lock_path = owner_lock_path(socket_path);
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -948,6 +948,19 @@ fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
         .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("opening owner lock {}", lock_path.display()))?;
+    // `mode` applies only on creation; tighten a pre-existing file we own.
+    let meta = file
+        .metadata()
+        .with_context(|| format!("stat owner lock {}", lock_path.display()))?;
+    // `/proc/self` is owned by the process's effective uid.
+    let me = std::fs::metadata("/proc/self")
+        .context("stat /proc/self")?
+        .uid();
+    if meta.uid() == me {
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(std::io::Error::from)
+            .with_context(|| format!("chmod owner lock {}", lock_path.display()))?;
+    }
     match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(Some(file)),
         Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
