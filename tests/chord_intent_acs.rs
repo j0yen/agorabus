@@ -15,6 +15,7 @@
 //! AC3/AC4 (CLI subcommands) and AC7 (version+changelog) are out of
 //! scope for this iteration and live in later iters.
 
+#![allow(clippy::indexing_slicing, clippy::panic)] // test code: a failing unwrap/index/panic is the intended failure signal
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

@@ -1,11 +1,12 @@
 //! Integration tests for PRD-changeover-claim-guard ACs 2-5.
 //!
 //! AC1 (compiles clean) is verified by the build itself.
-//! AC2: hold_claim → claim_list reports exactly 1 holder.
+//! AC2: `hold_claim` → `claim_list` reports exactly 1 holder.
 //! AC3: renew observed at least once within short TTL (300ms).
 //! AC4: drop and explicit release → holder count returns to 0.
 //! AC5: renew failure logs and does not panic; recovery succeeds.
 
+#![allow(clippy::indexing_slicing)] // test code: a failing unwrap/index/panic is the intended failure signal
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -15,7 +16,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agorabus::{Client, ClaimGuard};
@@ -27,7 +27,7 @@ fn now_unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-async fn announce_client(socket: &PathBuf, sid: &str) -> Client {
+async fn announce_client(socket: &std::path::Path, sid: &str) -> Client {
     let mut c = Client::connect(socket).await.expect("connect");
     let reply = c
         .announce(sid, std::process::id(), "/tmp", "claim-guard-test")
@@ -37,7 +37,7 @@ async fn announce_client(socket: &PathBuf, sid: &str) -> Client {
     c
 }
 
-/// AC2: after hold_claim, claim_list on a separate client reports exactly 1 holder.
+/// AC2: after `hold_claim`, `claim_list` on a separate client reports exactly 1 holder.
 #[test]
 fn claim_guard_ac2_hold_registers_one_holder() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -76,9 +76,9 @@ fn claim_guard_ac2_hold_registers_one_holder() {
 /// AC3: with TTL=300ms the renew fires at least once; holder count never
 /// drops to 0 during the guard's lifetime.
 ///
-/// We use TTL=1s (minimum resolution of ttl_unix_secs is 1 second, so 300ms
-/// would produce ttl_unix=now+0 which expires immediately). We watch for
-/// two consecutive claim_list calls with exactly 1 holder spanning a renewal.
+/// We use TTL=1s (minimum resolution of `ttl_unix_secs` is 1 second, so 300ms
+/// would produce `ttl_unix=now+0` which expires immediately). We watch for
+/// two consecutive `claim_list` calls with exactly 1 holder spanning a renewal.
 #[test]
 fn claim_guard_ac3_renew_fires_before_expiry() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -114,9 +114,9 @@ fn claim_guard_ac3_renew_fires_before_expiry() {
         let mut samples = 0u32;
         while start.elapsed() < total {
             let claims = query_client.claim_list().await.unwrap();
-            let holders: Vec<_> = claims.iter().filter(|c| c.path == path).collect();
+            let held = claims.iter().any(|c| c.path == path);
             assert!(
-                !holders.is_empty(),
+                held,
                 "holder count dropped to 0 at t={:?}",
                 start.elapsed()
             );
@@ -142,7 +142,7 @@ fn claim_guard_ac3_renew_fires_before_expiry() {
     });
 }
 
-/// AC4a: dropping a ClaimGuard releases the claim (holder count → 0).
+/// `AC4a`: dropping a `ClaimGuard` releases the claim (holder count → 0).
 #[test]
 fn claim_guard_ac4_drop_releases_claim() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -176,14 +176,14 @@ fn claim_guard_ac4_drop_releases_claim() {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let claims_after = query_client.claim_list().await.unwrap();
-        let holders: Vec<_> = claims_after.iter().filter(|c| c.path == path).collect();
-        assert!(holders.is_empty(), "claim must be released after drop, got {claims_after:?}");
+        let still_held = claims_after.iter().any(|c| c.path == path);
+        assert!(!still_held, "claim must be released after drop, got {claims_after:?}");
 
         h.shutdown().await;
     });
 }
 
-/// AC4b: explicit release() releases the claim (holder count → 0).
+/// `AC4b`: explicit `release()` releases the claim (holder count → 0).
 #[test]
 fn claim_guard_ac4_explicit_release() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -215,8 +215,8 @@ fn claim_guard_ac4_explicit_release() {
         guard.release().await.expect("explicit release should succeed");
 
         let claims_after = query_client.claim_list().await.unwrap();
-        let holders: Vec<_> = claims_after.iter().filter(|c| c.path == path).collect();
-        assert!(holders.is_empty(), "claim must be released after release(), got {claims_after:?}");
+        let still_held = claims_after.iter().any(|c| c.path == path);
+        assert!(!still_held, "claim must be released after release(), got {claims_after:?}");
 
         h.shutdown().await;
     });

@@ -37,7 +37,7 @@ fn canonical(p: &std::path::Path) -> String {
         .into_owned()
 }
 
-async fn announce_client(socket: &PathBuf, sid: &str) -> Client {
+async fn announce_client(socket: &std::path::Path, sid: &str) -> Client {
     let mut c = Client::connect(socket).await.expect("connect");
     let reply = c
         .announce(sid, std::process::id(), "/tmp", "claim-test")
@@ -67,14 +67,14 @@ fn claim_ac1_acquire_returns_ok_with_canonicalized_path() {
             .claim_acquire(&canon, ttl_unix, "ac1", false)
             .await
             .unwrap();
-        assert!(reply.ok, "expected ok, got {:?}", reply);
+        assert!(reply.ok, "expected ok, got {reply:?}");
         let data = reply.data.expect("payload present");
         assert_eq!(
             data.get("path").and_then(|v| v.as_str()).unwrap(),
             canon.as_str(),
             "path echoed back canonicalized"
         );
-        let echoed_ttl = data.get("ttl_unix_secs").and_then(|v| v.as_u64()).unwrap();
+        let echoed_ttl = data.get("ttl_unix_secs").and_then(serde_json::Value::as_u64).unwrap();
         assert_eq!(echoed_ttl, ttl_unix, "ttl_unix_secs echoed verbatim");
         assert!(PathBuf::from(&canon).is_absolute(), "path is absolute");
 
@@ -141,7 +141,7 @@ fn claim_ac3_conflict_from_different_session() {
         let detail = reply.data.expect("detail present on conflict");
         assert_eq!(detail.get("holder").and_then(|v| v.as_str()), Some("sid-A"));
         assert_eq!(
-            detail.get("expires_unix").and_then(|v| v.as_u64()),
+            detail.get("expires_unix").and_then(serde_json::Value::as_u64),
             Some(ttl_unix)
         );
 
@@ -169,12 +169,12 @@ fn claim_ac4_renewal_on_same_session() {
 
         let ttl2 = now_unix_secs() + 120;
         let r2 = a.claim_acquire(&canon, ttl2, "renew", false).await.unwrap();
-        assert!(r2.ok, "renewal should succeed, got {:?}", r2);
+        assert!(r2.ok, "renewal should succeed, got {r2:?}");
         let echoed = r2
             .data
             .as_ref()
             .and_then(|d| d.get("ttl_unix_secs"))
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap();
         assert!(
             echoed >= ttl1,
@@ -214,7 +214,7 @@ fn claim_ac5_release_is_idempotent() {
             .data
             .as_ref()
             .and_then(|d| d.get("released"))
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap();
         assert!(released1, "first release should report released:true");
 
@@ -224,7 +224,7 @@ fn claim_ac5_release_is_idempotent() {
             .data
             .as_ref()
             .and_then(|d| d.get("released"))
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap();
         assert!(!released2, "second release should report released:false");
 
@@ -272,7 +272,7 @@ fn claim_ac6_force_overrides_and_publishes_release_before_acquire() {
         let mut b = announce_client(&h.socket, "sid-B").await;
         let ttl_b = now_unix_secs() + 90;
         let r = b.claim_acquire(&canon, ttl_b, "force-B", true).await.unwrap();
-        assert!(r.ok, "force acquire should succeed, got {:?}", r);
+        assert!(r.ok, "force acquire should succeed, got {r:?}");
 
         // The next two events should be: claim.release for sid-A, then
         // claim.acquire for sid-B (in that order — daemon publishes release

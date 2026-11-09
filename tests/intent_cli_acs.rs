@@ -18,6 +18,7 @@
 //! owner connection — the real-world case (a session is on the bus; `intent
 //! set` updates it as a guest). The tests hold those owner Clients in scope.
 
+#![allow(clippy::panic)] // test code: a failing unwrap/index/panic is the intended failure signal
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -159,8 +160,8 @@ fn ac4_intent_list_filters_and_projects() {
         assert_eq!(a.get("skill").and_then(serde_json::Value::as_str), Some("/dream"));
         // Projection: only session_id + set intent fields. No pid/cwd/last_tool,
         // and no prd_slug/working_paths for A (unset).
-        let a_keys: Vec<&String> = a.as_object().unwrap().keys().collect();
-        assert_eq!(a_keys.len(), 2, "A should have session_id+skill only: {a}");
+        let a_key_count = a.as_object().unwrap().keys().count();
+        assert_eq!(a_key_count, 2, "A should have session_id+skill only: {a}");
         assert!(a.get("pid").is_none() && a.get("cwd").is_none(), "no pid/cwd leak: {a}");
 
         let b = by_sid("sid-B");

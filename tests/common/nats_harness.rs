@@ -15,12 +15,12 @@ use std::time::Duration;
 /// Returns true if `nats-server` is discoverable on `$PATH`.
 pub fn nats_server_available() -> bool {
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("nats-server").is_file()))
-        .unwrap_or(false)
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("nats-server").is_file()))
 }
 
 /// Print the AC12 skip message and return, for tests that need a real
 /// `nats-server` and find none on `$PATH`.
+#[allow(clippy::print_stdout)] // the skip notice is printed to the captured test stdout on purpose
 pub fn skip_no_nats_server(test_name: &str) {
     println!("skipped: nats-server not on PATH ({test_name})");
 }
@@ -81,9 +81,7 @@ impl NatsServer {
             if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
                 return;
             }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("nats-server did not become ready on port {}", self.port);
-            }
+            assert!((tokio::time::Instant::now() < deadline), "nats-server did not become ready on port {}", self.port);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }

@@ -16,7 +16,7 @@
 //! not sufficient on its own to prove repo-health.sh's verdict (a separate,
 //! CI-step-red or 7-day-window cause could still exist), so it deliberately
 //! does not claim to.
-//! Test predicate: tests/acceptance_ac1.rs
+//! Test predicate: `tests/acceptance_ac1.rs`
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

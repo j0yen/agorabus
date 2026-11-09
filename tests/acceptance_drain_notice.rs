@@ -33,7 +33,8 @@ mod common;
 
 use std::time::Duration;
 
-use agorabus::{Client, DrainNotice};
+use agorabus::{Client, DrainNotice, ServerEvent};
+use tokio::io::AsyncWriteExt as _;
 use common::DaemonHandle;
 
 // ---------------------------------------------------------------------------
@@ -153,7 +154,6 @@ fn ac3_shutdown_prompt_despite_stalled_subscriber() {
         // Send announce + subscribe so the daemon registers us as a subscriber.
         let announce_msg =
             r#"{"op":"announce","session_id":"stalled","pid":1,"cwd":"/","intent":""}"#;
-        use tokio::io::AsyncWriteExt as _;
         write_half
             .write_all(format!("{announce_msg}\n").as_bytes())
             .await
@@ -230,7 +230,6 @@ fn ac6_raw_line_reader_does_not_crash_on_drain_notice() {
     // Attempt 2: a "legacy" subscriber that tries ServerEvent and falls back
     // gracefully when it doesn't match (no panic, no crash). The parse will
     // fail (missing topic/data/from) — that's expected and acceptable.
-    use agorabus::ServerEvent;
     let result: Result<ServerEvent, _> = serde_json::from_str(raw);
     // Either Ok or Err is fine; just no panic/crash.
     let _ = result;

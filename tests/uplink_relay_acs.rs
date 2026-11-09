@@ -3,6 +3,7 @@
 //! `nats-server` (AC12: skip, don't pass vacuously, when absent) and two
 //! real agorabus daemons.
 
+#![allow(clippy::indexing_slicing)] // test code: a failing unwrap/index/panic is the intended failure signal
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -14,6 +15,7 @@
 mod common;
 
 use agorabus::{Client, UplinkConfig, UplinkStatus};
+use futures::StreamExt as _;
 use common::DaemonHandle;
 use common::nats_harness::{NatsServer, nats_server_available, skip_no_nats_server};
 use std::time::Duration;
@@ -58,9 +60,7 @@ async fn wait_connected(socket: &std::path::Path, sid: &str) {
         if matches!(status, UplinkStatus::Connected { .. }) {
             return;
         }
-        if Instant::now() >= deadline {
-            panic!("uplink never reported connected for {sid}: {status:?}");
-        }
+        assert!(Instant::now() < deadline, "uplink never reported connected for {sid}: {status:?}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -96,7 +96,6 @@ fn ac6_publish_wraps_envelope_on_nats_subject() {
             .await
             .unwrap();
 
-        use futures::StreamExt as _;
         let msg = timeout(Duration::from_secs(5), raw_sub.next())
             .await
             .expect("timed out waiting for NATS relay")
@@ -198,11 +197,8 @@ fn ac8_no_self_echo_and_no_amplification() {
 
         // B must see exactly 10 (one per message, no amplification).
         let mut count_b = 0;
-        loop {
-            match timeout(Duration::from_millis(800), sub_b.next_event()).await {
-                Ok(Ok(Some(_ev))) => count_b += 1,
-                _ => break,
-            }
+        while let Ok(Ok(Some(_ev))) = timeout(Duration::from_millis(800), sub_b.next_event()).await {
+            count_b += 1;
         }
         assert_eq!(count_b, 10, "B should see exactly one delivery per message");
 
@@ -210,11 +206,8 @@ fn ac8_no_self_echo_and_no_amplification() {
         // normal local-bus behavior, unrelated to the uplink) but must NOT
         // see any additional uplink echo of its own messages beyond that.
         let mut count_a = 0;
-        loop {
-            match timeout(Duration::from_millis(800), sub_a.next_event()).await {
-                Ok(Ok(Some(_ev))) => count_a += 1,
-                _ => break,
-            }
+        while let Ok(Ok(Some(_ev))) = timeout(Duration::from_millis(800), sub_a.next_event()).await {
+            count_a += 1;
         }
         assert_eq!(
             count_a, 10,

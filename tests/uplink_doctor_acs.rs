@@ -21,7 +21,7 @@ use common::nats_harness::{NatsServer, nats_server_available, skip_no_nats_serve
 use std::process::Command;
 use std::time::Duration;
 
-fn agorabus_bin() -> &'static str {
+const fn agorabus_bin() -> &'static str {
     env!("CARGO_BIN_EXE_agorabus")
 }
 
@@ -68,9 +68,7 @@ fn ac3_doctor_reports_connected() {
                 );
                 break;
             }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("doctor never reported connected; last output:\n{stdout}");
-            }
+            assert!(tokio::time::Instant::now() < deadline, "doctor never reported connected; last output:\n{stdout}");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 

@@ -130,6 +130,13 @@ impl FleetStore {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// True when there are no entries.
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Merge local UDS peers with fleet peers.
@@ -230,6 +237,7 @@ pub async fn collect_fleet_peers_from_bus(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)] // test module: a failing unwrap/index/panic is the intended failure signal
     use super::*;
     use crate::protocol::FleetPresenceEvent;
 
