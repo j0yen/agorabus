@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use agorabus::doctor::find_daemon_pid_for;
 use agorabus::reload::{
+    check_pid_cmdline, recheck_daemon_pid,
     Bounce, ReloadConfig, ReloadFormat, ReloadStatus, run_reload, snapshot_peers_within,
     start_daemon_if_lock_free,
 };
@@ -64,6 +65,22 @@ impl Sandbox {
             .env("XDG_RUNTIME_DIR", self.tmp.path().join("xdg"))
             .arg("--socket")
             .arg(&self.socket);
+        cmd
+    }
+
+    /// Daemon with the global flag after the subcommand:
+    /// `agorabus daemon --socket X ...`.
+    fn daemon_cmd_flag_after(&self) -> Command {
+        let mut cmd = Command::new(bin());
+        cmd.env("HOME", self.tmp.path().join("home"))
+            .env("XDG_RUNTIME_DIR", self.tmp.path().join("xdg"))
+            .arg("daemon")
+            .arg("--socket")
+            .arg(&self.socket)
+            .args(self.daemon_args())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         cmd
     }
 
@@ -279,4 +296,44 @@ fn no_peers_reload_with_unbound_daemon_is_not_reloaded() {
             .status();
     }
     assert_eq!(verdict.status, ReloadStatus::Failed, "{verdict:?}");
+}
+
+/// A1475 gate correction: `agorabus daemon --socket X` (flag after the
+/// subcommand) is attributed to X, never to the default socket.
+#[test]
+fn discovery_reads_socket_flag_after_daemon() {
+    let sb = Sandbox::new();
+    let mut pids = Pids::default();
+    let pid = spawn_tracked(&mut sb.daemon_cmd_flag_after(), &mut pids);
+    wait_socket(&sb.socket);
+    assert_eq!(find_daemon_pid_for(&sb.socket), Some(pid));
+    assert_ne!(find_daemon_pid_for(&agorabus::default_socket_path()), Some(pid));
+}
+
+/// A1475 gate correction: the pre-signal re-check spares a pid that now serves
+/// another socket, is not a daemon, or is gone.
+#[test]
+fn recheck_refuses_pid_serving_other_socket() {
+    let a = Sandbox::new();
+    let other = a.tmp.path().join("run/other");
+    let mut pids = Pids::default();
+    let pid = spawn_tracked(&mut a.daemon_cmd_flag_after(), &mut pids);
+    wait_socket(&a.socket);
+    assert!(recheck_daemon_pid(pid, &a.socket).is_ok());
+    let err = recheck_daemon_pid(pid, &other).unwrap_err();
+    assert!(err.contains(&pid.to_string()), "{err}");
+
+    let sleeper = spawn_tracked(Command::new("sleep").arg("30"), &mut pids);
+    assert!(recheck_daemon_pid(sleeper, &a.socket).unwrap_err().contains(&sleeper.to_string()));
+}
+
+#[test]
+fn check_pid_cmdline_cases() {
+    let sock = Path::new("/p/x/sock");
+    assert!(check_pid_cmdline(7, sock, Some(b"agorabus\0daemon\0--socket\0/p/x/sock\0")).is_ok());
+    assert!(check_pid_cmdline(7, sock, Some(b"agorabus\0--socket=/p/x/sock\0daemon\0")).is_ok());
+    let e = check_pid_cmdline(7, sock, Some(b"agorabus\0daemon\0--socket\0/p/y/sock\0")).unwrap_err();
+    assert!(e.contains("pid 7"), "{e}");
+    assert!(check_pid_cmdline(7, sock, Some(b"sleep\030\0")).is_err());
+    assert!(check_pid_cmdline(7, sock, None).unwrap_err().contains("pid 7"));
 }

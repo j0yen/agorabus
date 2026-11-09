@@ -349,6 +349,10 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
     // A lock still held at the bound means the old daemon keeps serving: no
     // new daemon is launched and the reload fails.
     let binary = discover_binary()?;
+    if let Err(why) = recheck_daemon_pid(old_pid, &cfg.socket_path) {
+        eprintln!("agorabus reload: {why}; not signalling");
+        return Ok((failed(Some(old_pid), None, peers_before), ExitCode::from(1)));
+    }
     let new_pid = match bounce_daemon(
         &cfg.socket_path,
         old_pid,
@@ -723,6 +727,42 @@ async fn snapshot_peers_unbounded(socket: &Path) -> Result<Vec<String>> {
 /// Extra time, beyond `drain_timeout_ms`, to wait for the old daemon's owner
 /// lock to be released before reload gives up without launching.
 pub const OWNER_LOCK_EXTRA_WAIT: Duration = Duration::from_secs(10);
+
+/// Decide from a fresh `/proc/<pid>/cmdline` read (`None` = unreadable) whether
+/// `pid` may still be signalled as the daemon serving `socket_path`.
+///
+/// # Errors
+///
+/// A message naming the pid when it is gone, no longer an `agorabus daemon`,
+/// or now serves a different socket.
+pub fn check_pid_cmdline(
+    pid: u32,
+    socket_path: &Path,
+    raw: Option<&[u8]>,
+) -> std::result::Result<(), String> {
+    let Some(raw) = raw else {
+        return Err(format!("pid {pid} is gone"));
+    };
+    if doctor::cmdline_serves_socket(raw, socket_path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "pid {pid} is no longer an agorabus daemon serving {}",
+            socket_path.display()
+        ))
+    }
+}
+
+/// Re-read `pid`'s cmdline and apply [`check_pid_cmdline`]; called right
+/// before SIGTERM so a pid recycled or re-purposed since discovery is spared.
+///
+/// # Errors
+///
+/// See [`check_pid_cmdline`].
+pub fn recheck_daemon_pid(pid: u32, socket_path: &Path) -> std::result::Result<(), String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok();
+    check_pid_cmdline(pid, socket_path, raw.as_deref())
+}
 
 /// Result of [`bounce_daemon`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

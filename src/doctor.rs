@@ -231,12 +231,8 @@ pub fn find_daemon_pid_for(socket: &Path) -> Option<u32> {
         let Some(daemon_socket) = daemon_cmdline_socket(&raw) else {
             continue;
         };
-        let served = match &daemon_socket {
-            DaemonSocket::Default => &default_socket,
-            DaemonSocket::Explicit(p) => p,
-        };
-        if served == socket {
-            pids.push(pid);
+        if socket_matches(&daemon_socket, socket, &default_socket) {
+            pids.extend([pid]);
         }
     }
     pids.sort_unstable();
@@ -254,6 +250,8 @@ enum DaemonSocket {
 
 /// Parse a NUL-separated `/proc/<pid>/cmdline`.
 ///
+/// `--socket` is a clap global flag, so `--socket X` / `--socket=X` is read
+/// from the whole argv, before or after `daemon`; the last occurrence wins.
 /// `None` when it is not an `agorabus daemon`.
 fn daemon_cmdline_socket(raw: &[u8]) -> Option<DaemonSocket> {
     let mut args = raw
@@ -264,20 +262,52 @@ fn daemon_cmdline_socket(raw: &[u8]) -> Option<DaemonSocket> {
         return None;
     }
     let mut socket = DaemonSocket::Default;
+    let mut seen_daemon = false;
     while let Some(arg) = args.next() {
-        if arg == "daemon" {
-            return Some(socket);
-        }
         if arg == "--socket" {
-            socket = DaemonSocket::Explicit(PathBuf::from(args.next()?));
+            // A missing value reads as the empty trailing NUL field.
+            let v = args.next().filter(|v| !v.is_empty())?;
+            socket = DaemonSocket::Explicit(PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--socket=") {
             socket = DaemonSocket::Explicit(PathBuf::from(v));
+        } else if seen_daemon {
+            // Daemon's own flags and values.
+        } else if arg == "daemon" {
+            seen_daemon = true;
         } else {
             // Any other token before the subcommand is not a daemon command.
             return None;
         }
     }
-    None
+    seen_daemon.then_some(socket)
+}
+
+/// Canonical form of `p`; a missing leaf falls back to canonical parent + leaf.
+fn canonical(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| {
+        match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
+            (Some(d), Some(f)) => d.join(f),
+            _ => p.to_path_buf(),
+        }
+    })
+}
+
+fn socket_matches(served: &DaemonSocket, socket: &Path, default_socket: &Path) -> bool {
+    let served = match served {
+        DaemonSocket::Default => default_socket,
+        DaemonSocket::Explicit(p) => p,
+    };
+    served == socket || canonical(served) == canonical(socket)
+}
+
+/// Whether a raw `/proc/<pid>/cmdline` is an `agorabus daemon` serving `socket`.
+///
+/// A daemon with no `--socket` serves the default socket (from the caller's
+/// `HOME`) only.
+#[must_use]
+pub fn cmdline_serves_socket(raw: &[u8], socket: &Path) -> bool {
+    daemon_cmdline_socket(raw)
+        .is_some_and(|d| socket_matches(&d, socket, &crate::default_socket_path()))
 }
 
 /// Read the raw symlink target of `/proc/<pid>/exe`.
@@ -376,8 +406,39 @@ mod tests {
     }
 
     #[test]
+    fn cmdline_socket_reads_flag_after_daemon() {
+        let sock = |s: &str| Some(DaemonSocket::Explicit(PathBuf::from(s)));
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket\0/a/s\0"), sock("/a/s"));
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket=/a/s\0"), sock("/a/s"));
+        assert_eq!(
+            daemon_cmdline_socket(b"agorabus\0daemon\0--state-file\0f\0--socket\0/a/s\0"),
+            sock("/a/s")
+        );
+        // Last occurrence wins, across the subcommand.
+        assert_eq!(
+            daemon_cmdline_socket(b"agorabus\0--socket\0/a/1\0daemon\0--socket=/a/2\0"),
+            sock("/a/2")
+        );
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket\0"), None);
+    }
+
+    #[test]
+    fn cmdline_serves_socket_by_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let via_link = dir.path().join("link/sock");
+        let real = dir.path().join("real/sock");
+        let raw = format!("agorabus\0daemon\0--socket\0{}\0", via_link.display());
+        assert!(cmdline_serves_socket(raw.as_bytes(), &real));
+        assert!(!cmdline_serves_socket(raw.as_bytes(), &dir.path().join("real/other")));
+        assert!(!cmdline_serves_socket(b"sleep\0daemon\0", &real));
+    }
+
+    #[test]
     fn cmdline_socket_rejects_non_daemons() {
         assert_eq!(daemon_cmdline_socket(b"/x/agorabus\0peers\0"), None);
+        assert_eq!(daemon_cmdline_socket(b"/x/agorabus\0peers\0daemon\0"), None);
         assert_eq!(daemon_cmdline_socket(b"sleep\0daemon\0"), None);
         assert_eq!(daemon_cmdline_socket(b""), None);
     }
