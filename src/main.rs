@@ -31,7 +31,7 @@ use agorabus::{
     Client, ClientMessage, DaemonConfig, ReconnectConfig,
     default_socket_path, default_uplink_config_path, load_uplink_config,
     DEFAULT_DRAIN_GRACE_MS, DEFAULT_DRAIN_RESUME_HINT_MS, DEFAULT_STATE_FLUSH_MS,
-    doctor::{DoctorFormat, print_report, run_doctor},
+    doctor::{DoctorFormat, print_report, run_doctor_for_socket},
     fleet::collect_fleet_peers_from_bus,
     persist::default_state_path,
     protocol::{FLEET_PEER_TTL_SECS, ServerEvent},
@@ -39,7 +39,7 @@ use agorabus::{
     reload::{ReloadConfig, ReloadFormat, print_verdict, run_reload},
 };
 use tokio::time::{Instant, timeout};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -208,15 +208,20 @@ enum Command {
         /// bypass (e.g. for testing the bounce itself).
         #[arg(long, default_value_t = true)]
         require_fresh: bool,
+        /// Bypass the no-op guard (the inverse of `--require-fresh`).
+        #[arg(long)]
+        no_require_fresh: bool,
         /// Start a new daemon even if none is currently running.
         #[arg(long, default_value_t = false)]
         start_if_absent: bool,
         /// Print the plan + freshness verdict + peer set that *would* be
         /// bounced, without mutating anything. This is the default posture
-        /// (--dry-run true); pass `--no-dry-run` (or `--apply`) to perform
-        /// the actual reload.
+        /// (--dry-run true); pass `--apply` to perform the actual reload.
         #[arg(long, default_value_t = true)]
         dry_run: bool,
+        /// Perform the reload (sets dry-run false).
+        #[arg(long)]
+        apply: bool,
         /// Milliseconds to wait for the old daemon to exit after SIGTERM.
         #[arg(long, default_value_t = 2_000)]
         drain_timeout_ms: u64,
@@ -356,15 +361,21 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             };
             let (_ready_tx, _ready_rx) = tokio::sync::oneshot::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let daemon = tokio::spawn(async move { run_daemon(cfg, None, shutdown_rx).await });
+            let mut daemon = tokio::spawn(async move { run_daemon(cfg, None, shutdown_rx).await });
 
-            // Wait for SIGINT / SIGTERM, then signal shutdown.
+            // Wait for SIGINT / SIGTERM, then signal shutdown. A daemon that
+            // returns first never bound: Ok = another owner already serves
+            // the socket (exit 0), Err = refused or failed to bind (exit 2).
             use tokio::signal::unix::{SignalKind, signal};
             let mut sigint = signal(SignalKind::interrupt())?;
             let mut sigterm = signal(SignalKind::terminate())?;
             tokio::select! {
                 _ = sigint.recv() => {}
                 _ = sigterm.recv() => {}
+                early = &mut daemon => {
+                    early.context("daemon task")??;
+                    return Ok(ExitCode::SUCCESS);
+                }
             }
             let _ = shutdown_tx.send(());
             let _ = daemon.await;
@@ -526,7 +537,7 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             // connection needed for the staleness verdict (it inspects the
             // daemon, doesn't talk to it) — `code` is derived from this
             // alone and is never touched by the uplink query below (AC11).
-            let (mut report, code) = run_doctor(installed_path.as_deref());
+            let (mut report, code) = run_doctor_for_socket(installed_path.as_deref(), &socket);
 
             // Best-effort NATS-uplink status (PRD-agorabus-nats-uplink
             // AC3/AC4): report-only, fail-open — no running daemon or a
@@ -576,8 +587,10 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
         Command::Reload {
             format,
             require_fresh,
+            no_require_fresh,
             start_if_absent,
             dry_run,
+            apply,
             drain_timeout_ms,
             reconnect_timeout_ms,
             installed_path,
@@ -589,9 +602,9 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             };
             let cfg = ReloadConfig {
                 socket_path: socket,
-                require_fresh,
+                require_fresh: require_fresh && !no_require_fresh,
                 start_if_absent,
-                dry_run,
+                dry_run: dry_run && !apply,
                 drain_timeout_ms,
                 reconnect_timeout_ms,
                 format: fmt,

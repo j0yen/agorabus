@@ -93,9 +93,19 @@ pub struct DoctorReport {
 /// `installed_path` is the path of the `agorabus` binary on disk (i.e. the one
 /// to compare against).  When `None` the function attempts to discover it via
 /// `which agorabus` / the current executable.
+#[must_use]
 pub fn run_doctor(installed_path: Option<&Path>) -> (DoctorReport, ExitCode) {
+    run_doctor_for_socket(installed_path, &crate::default_socket_path())
+}
+
+/// Like [`run_doctor`], for the daemon serving `socket`.
+#[must_use]
+pub fn run_doctor_for_socket(
+    installed_path: Option<&Path>,
+    socket: &Path,
+) -> (DoctorReport, ExitCode) {
     // 1. Find the daemon pid.
-    let daemon_pid = find_daemon_pid();
+    let daemon_pid = find_daemon_pid_for(socket);
 
     let Some(pid) = daemon_pid else {
         let report = DoctorReport {
@@ -196,15 +206,18 @@ pub fn print_report(report: &DoctorReport, format: DoctorFormat) {
 
 // ── private helpers ──────────────────────────────────────────────────────────
 
-/// Scan `/proc` for the `agorabus daemon` process.
+/// Scan `/proc` for the `agorabus daemon` process serving `socket`.
 ///
-/// Returns the first matching pid (smallest, for determinism).
-fn find_daemon_pid() -> Option<u32> {
+/// A daemon matches by its `--socket` value; one started without `--socket`
+/// matches the default socket only. Returns the smallest matching pid.
+#[must_use]
+pub fn find_daemon_pid_for(socket: &Path) -> Option<u32> {
     let proc_dir = Path::new("/proc");
     let Ok(entries) = std::fs::read_dir(proc_dir) else {
         return None;
     };
 
+    let default_socket = crate::default_socket_path();
     let mut pids: Vec<u32> = Vec::new();
     for entry in entries.flatten() {
         let fname = entry.file_name();
@@ -212,29 +225,92 @@ fn find_daemon_pid() -> Option<u32> {
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
-        if is_agorabus_daemon(pid) {
-            pids.push(pid);
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let Some(daemon_socket) = daemon_cmdline_socket(&raw) else {
+            continue;
+        };
+        if socket_matches(&daemon_socket, socket, &default_socket) {
+            pids.extend([pid]);
         }
     }
     pids.sort_unstable();
     pids.into_iter().next()
 }
 
-/// Return true if `/proc/<pid>/cmdline` looks like `agorabus daemon`.
-fn is_agorabus_daemon(pid: u32) -> bool {
-    let path = format!("/proc/{pid}/cmdline");
-    let Ok(raw) = std::fs::read(&path) else {
-        return false;
+/// The socket an `agorabus daemon` process was started for.
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonSocket {
+    /// No `--socket` flag: the default socket.
+    Default,
+    /// The `--socket` value.
+    Explicit(PathBuf),
+}
+
+/// Parse a NUL-separated `/proc/<pid>/cmdline`.
+///
+/// `--socket` is a clap global flag, so `--socket X` / `--socket=X` is read
+/// from the whole argv, before or after `daemon`; the last occurrence wins.
+/// `None` when it is not an `agorabus daemon`.
+fn daemon_cmdline_socket(raw: &[u8]) -> Option<DaemonSocket> {
+    let mut args = raw
+        .split(|b| *b == 0)
+        .map(|a| String::from_utf8_lossy(a).into_owned());
+    // argv[0] must be a path whose basename is exactly "agorabus".
+    if Path::new(&args.next()?).file_name() != Some(std::ffi::OsStr::new("agorabus")) {
+        return None;
+    }
+    let mut socket = DaemonSocket::Default;
+    let mut seen_daemon = false;
+    while let Some(arg) = args.next() {
+        if arg == "--socket" {
+            // A missing value reads as the empty trailing NUL field.
+            let v = args.next().filter(|v| !v.is_empty())?;
+            socket = DaemonSocket::Explicit(PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--socket=") {
+            if v.is_empty() {
+                return None;
+            }
+            socket = DaemonSocket::Explicit(PathBuf::from(v));
+        } else if seen_daemon {
+            // Daemon's own flags and values.
+        } else if arg == "daemon" {
+            seen_daemon = true;
+        } else {
+            // Any other token before the subcommand is not a daemon command.
+            return None;
+        }
+    }
+    seen_daemon.then_some(socket)
+}
+
+/// Canonical form of `p`; a missing leaf falls back to canonical parent + leaf.
+fn canonical(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| {
+        match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
+            (Some(d), Some(f)) => d.join(f),
+            _ => p.to_path_buf(),
+        }
+    })
+}
+
+fn socket_matches(served: &DaemonSocket, socket: &Path, default_socket: &Path) -> bool {
+    let served = match served {
+        DaemonSocket::Default => default_socket,
+        DaemonSocket::Explicit(p) => p,
     };
-    // cmdline is NUL-separated: argv[0]\0argv[1]\0…
-    let args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
-    let (Some(first), Some(second)) = (args.first(), args.get(1)) else {
-        return false;
-    };
-    let argv0 = String::from_utf8_lossy(first);
-    let argv1 = String::from_utf8_lossy(second);
-    // Match "agorabus" (any path suffix) + first arg == "daemon"
-    argv0.ends_with("agorabus") && argv1 == "daemon"
+    served == socket || canonical(served) == canonical(socket)
+}
+
+/// Whether a raw `/proc/<pid>/cmdline` is an `agorabus daemon` serving `socket`.
+///
+/// A daemon with no `--socket` serves the default socket (from the caller's
+/// `HOME`) only.
+#[must_use]
+pub fn cmdline_serves_socket(raw: &[u8], socket: &Path) -> bool {
+    daemon_cmdline_socket(raw)
+        .is_some_and(|d| socket_matches(&d, socket, &crate::default_socket_path()))
 }
 
 /// Read the raw symlink target of `/proc/<pid>/exe`.
@@ -312,22 +388,74 @@ fn read_xattr(path: &Path, name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
-    // ── is_agorabus_daemon ──────────────────────────────────────────────────
+    // ── daemon_cmdline_socket ───────────────────────────────────────────────
 
     #[test]
-    fn is_agorabus_daemon_rejects_self() {
-        // The test process is not an agorabus daemon.
-        let my_pid = std::process::id();
-        assert!(!is_agorabus_daemon(my_pid));
+    fn cmdline_socket_parses_flag_forms() {
+        let sock = |s: &str| Some(DaemonSocket::Explicit(PathBuf::from(s)));
+        assert_eq!(daemon_cmdline_socket(b"/x/agorabus\0daemon\0"), Some(DaemonSocket::Default));
+        assert_eq!(
+            daemon_cmdline_socket(b"/x/agorabus\0--socket\0/a/s\0daemon\0--state-file\0f\0"),
+            sock("/a/s")
+        );
+        assert_eq!(
+            daemon_cmdline_socket(b"agorabus\0--socket=/a/s\0daemon\0"),
+            sock("/a/s")
+        );
     }
 
     #[test]
-    fn is_agorabus_daemon_rejects_nonexistent_pid() {
-        // PID 0 is never a user process.
-        assert!(!is_agorabus_daemon(0));
+    fn cmdline_socket_reads_flag_after_daemon() {
+        let sock = |s: &str| Some(DaemonSocket::Explicit(PathBuf::from(s)));
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket\0/a/s\0"), sock("/a/s"));
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket=/a/s\0"), sock("/a/s"));
+        assert_eq!(
+            daemon_cmdline_socket(b"agorabus\0daemon\0--state-file\0f\0--socket\0/a/s\0"),
+            sock("/a/s")
+        );
+        // Last occurrence wins, across the subcommand.
+        assert_eq!(
+            daemon_cmdline_socket(b"agorabus\0--socket\0/a/1\0daemon\0--socket=/a/2\0"),
+            sock("/a/2")
+        );
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket\0"), None);
+        // An empty value is the same in both spellings.
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket=\0"), None);
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket\0\0"), None);
+    }
+
+    #[test]
+    fn cmdline_argv0_is_basename_equality() {
+        let sock = |s: &str| Some(DaemonSocket::Explicit(PathBuf::from(s)));
+        assert_eq!(daemon_cmdline_socket(b"/usr/bin/agorabus\0daemon\0--socket\0/a/s\0"), sock("/a/s"));
+        assert_eq!(daemon_cmdline_socket(b"/usr/bin/notagorabus\0daemon\0--socket\0/a/s\0"), None);
+        assert_eq!(daemon_cmdline_socket(b"notagorabus\0daemon\0--socket\0/a/s\0"), None);
+        assert_eq!(daemon_cmdline_socket(b"/x/agorabus-old\0daemon\0--socket\0/a/s\0"), None);
+    }
+
+    #[test]
+    fn cmdline_serves_socket_by_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let via_link = dir.path().join("link/sock");
+        let real = dir.path().join("real/sock");
+        let raw = format!("agorabus\0daemon\0--socket\0{}\0", via_link.display());
+        assert!(cmdline_serves_socket(raw.as_bytes(), &real));
+        assert!(!cmdline_serves_socket(raw.as_bytes(), &dir.path().join("real/other")));
+        assert!(!cmdline_serves_socket(b"sleep\0daemon\0", &real));
+    }
+
+    #[test]
+    fn cmdline_socket_rejects_non_daemons() {
+        assert_eq!(daemon_cmdline_socket(b"/x/agorabus\0peers\0"), None);
+        assert_eq!(daemon_cmdline_socket(b"/x/agorabus\0peers\0daemon\0"), None);
+        assert_eq!(daemon_cmdline_socket(b"sleep\0daemon\0"), None);
+        assert_eq!(daemon_cmdline_socket(b""), None);
     }
 
     // ── DoctorFormat::parse ─────────────────────────────────────────────────
@@ -354,7 +482,7 @@ mod tests {
         // In unit-test context there is no running `agorabus daemon`.
         // We can't guarantee that — skip only if one happens to be running.
         // The test checks the exit-code contract for the no-daemon path.
-        if find_daemon_pid().is_some() {
+        if find_daemon_pid_for(&crate::default_socket_path()).is_some() {
             // A live daemon is running; skip to avoid false failures.
             return;
         }

@@ -158,10 +158,16 @@ pub(crate) struct BroadcastMsg {
 /// `ready_tx` (optional) fires once the socket is bound and chmod'd; tests use
 /// this to avoid racing connect-before-listen.
 ///
+/// Returns `Ok(())` at once, without binding and with the socket untouched,
+/// when another daemon holds `<socket>.lock` or a live listener already
+/// answers on the socket (`ready_tx` is then dropped unfired).
+///
 /// # Errors
 ///
-/// Returns the error from creating parent dirs, binding, or chmod'ing the
-/// socket. Accept-loop errors are logged but do not terminate the daemon.
+/// Returns the error from creating parent dirs, taking the owner lock,
+/// an inconclusive socket probe (fail closed: timeout, an unexpected connect
+/// error, or a non-socket at the path), binding, or chmod'ing the socket.
+/// Accept-loop errors are logged but do not terminate the daemon.
 // Cognitive complexity is high by design, same rationale as `handle_line`:
 // this is the single top-level orchestrator (bind, rehydrate state, spawn
 // the persist task, conditionally spawn the uplink tasks, run the
@@ -185,14 +191,42 @@ pub async fn run_daemon(
         }
     }
 
-    // Remove stale socket file if present (from a crashed previous daemon).
-    if tokio::fs::metadata(socket_path).await.is_ok() {
-        let _ = tokio::fs::remove_file(socket_path).await;
+    // Ownership check before any unlink or bind (A1455): one live owner per
+    // socket path. `_owner_lock` is held for the daemon's whole lifetime; the
+    // kernel releases it when the process exits, however it exits.
+    let Some(_owner_lock) = acquire_owner_lock(socket_path)? else {
+        eprintln!(
+            "agorabus: another daemon holds {}; not starting, socket left untouched",
+            owner_lock_path(socket_path).display()
+        );
+        // Exit 0, not an error: a unit with Restart=on-failure must not loop.
+        return Ok(());
+    };
+    match probe_socket(socket_path).await? {
+        SocketProbe::Absent => {}
+        SocketProbe::Stale => {
+            // A socket file nobody listens on (a crashed previous daemon).
+            tokio::fs::remove_file(socket_path)
+                .await
+                .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
+        }
+        SocketProbe::Live => {
+            eprintln!(
+                "agorabus: a live daemon already answers on {} without the owner lock; not starting, socket left untouched",
+                socket_path.display()
+            );
+            // Exit 0, not an error: a unit with Restart=on-failure must not loop.
+            return Ok(());
+        }
     }
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding UDS at {}", socket_path.display()))?;
     set_mode(socket_path, 0o600)?;
+    // Identity of the socket this daemon bound; shutdown unlinks the path
+    // only while it still names this inode, never a successor's socket.
+    let bound_id = file_identity(socket_path)
+        .with_context(|| format!("reading bound socket {}", socket_path.display()))?;
 
     // Rehydrate durable state from the journal, then prune expired claims.
     let durable = load_state(&config.state_file).unwrap_or_else(|e| {
@@ -276,7 +310,9 @@ pub async fn run_daemon(
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                let _ = tokio::fs::remove_file(socket_path).await;
+                if file_identity(socket_path).ok() == Some(bound_id) {
+                    let _ = tokio::fs::remove_file(socket_path).await;
+                }
 
                 // Broadcast the drain notice to every subscribed connection.
                 // Best-effort: if there are no active subscriber receivers the
@@ -885,6 +921,111 @@ async fn run_fleet_presence_broadcaster(
             });
         }
     }
+}
+
+/// Lock file guarding one socket path: `<socket path>.lock`.
+pub(crate) fn owner_lock_path(socket_path: &Path) -> PathBuf {
+    let mut name = socket_path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Open (create, mode 0600) the owner lock and take `flock(LOCK_EX|LOCK_NB)`.
+///
+/// `Ok(Some(file))`: this process owns the path while `file` stays open.
+/// `Ok(None)`: another process holds the lock (it owns or is starting on
+/// this path). `Err`: the lock could not be opened or taken for any other
+/// reason; the caller fails closed. The lock file itself is never unlinked:
+/// removing it would let two daemons lock two different inodes.
+pub(crate) fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let lock_path = owner_lock_path(socket_path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("opening owner lock {}", lock_path.display()))?;
+    // `mode` applies only on creation; tighten a pre-existing file we own.
+    let meta = file
+        .metadata()
+        .with_context(|| format!("stat owner lock {}", lock_path.display()))?;
+    let me = rustix::process::geteuid().as_raw();
+    if meta.uid() == me {
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(std::io::Error::from)
+            .with_context(|| format!("chmod owner lock {}", lock_path.display()))?;
+    }
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(file)),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
+        Err(e) => Err(std::io::Error::from(e))
+            .with_context(|| format!("locking owner lock {}", lock_path.display())),
+    }
+}
+
+/// What a connect probe found at the socket path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketProbe {
+    /// Nothing at the path.
+    Absent,
+    /// A socket file with no listener (connection refused).
+    Stale,
+    /// A listener accepted the connection.
+    Live,
+}
+
+/// Bound for the pre-bind connect probe.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Connect-probe `socket_path` with a [`PROBE_TIMEOUT`] bound.
+///
+/// # Errors
+///
+/// Fails closed: a timeout, any connect error other than not-found or
+/// connection-refused, or a non-socket file at the path (which also reports
+/// connection-refused) is returned as an error so the caller never unlinks
+/// or binds over it.
+async fn probe_socket(socket_path: &Path) -> Result<SocketProbe> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt as _;
+    let connect = tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(socket_path)).await;
+    match connect {
+        Ok(Ok(_stream)) => Ok(SocketProbe::Live),
+        Ok(Err(e)) if e.kind() == ErrorKind::NotFound => Ok(SocketProbe::Absent),
+        Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => {
+            let meta = std::fs::symlink_metadata(socket_path)
+                .with_context(|| format!("probing {}", socket_path.display()))?;
+            if meta.file_type().is_socket() {
+                Ok(SocketProbe::Stale)
+            } else {
+                anyhow::bail!(
+                    "refusing to start: {} exists and is not a socket",
+                    socket_path.display()
+                )
+            }
+        }
+        Ok(Err(e)) => Err(e).with_context(|| {
+            format!(
+                "refusing to start: probing {} failed",
+                socket_path.display()
+            )
+        }),
+        Err(_elapsed) => anyhow::bail!(
+            "refusing to start: probing {} timed out after {}ms",
+            socket_path.display(),
+            PROBE_TIMEOUT.as_millis()
+        ),
+    }
+}
+
+/// `(device, inode)` of the file at `path`, not following symlinks.
+fn file_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(path)?;
+    Ok((meta.dev(), meta.ino()))
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
