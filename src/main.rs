@@ -343,6 +343,12 @@ fn main() -> ExitCode {
 async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
     match cmd {
         Command::Daemon { heartbeat_timeout, drain_grace_ms, drain_resume_hint_ms, state_file, state_flush_ms, uplink_config } => {
+            // Register the handlers first: a SIGTERM that arrives while the
+            // config loads or the daemon task starts must reach the graceful
+            // shutdown arm, not the default (kill) action.
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigint = signal(SignalKind::interrupt())?;
+            let mut sigterm = signal(SignalKind::terminate())?;
             let uplink = load_uplink_config(&uplink_config.unwrap_or_else(default_uplink_config_path));
             let cfg = DaemonConfig {
                 socket_path: socket,
@@ -361,9 +367,6 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             // Wait for SIGINT / SIGTERM, then signal shutdown. A daemon that
             // returns first never bound: Ok = another owner already serves
             // the socket (exit 0), Err = refused or failed to bind (exit 2).
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigint = signal(SignalKind::interrupt())?;
-            let mut sigterm = signal(SignalKind::terminate())?;
             tokio::select! {
                 _ = sigint.recv() => {}
                 _ = sigterm.recv() => {}

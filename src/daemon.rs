@@ -969,6 +969,45 @@ pub(crate) fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::F
     }
 }
 
+/// Who holds the owner lock for a socket path, read from `/proc/locks`
+/// without taking the lock (so a daemon starting at the same moment never
+/// sees a probe's transient hold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockHolder {
+    /// No process holds the lock.
+    Free,
+    /// This pid holds the lock.
+    Pid(u32),
+    /// Held, but `/proc/locks` is unreadable or does not name a pid here.
+    Unknown,
+}
+
+/// Look up the holder of `<socket>.lock` in `/proc/locks`.
+pub(crate) fn owner_lock_holder(socket_path: &Path) -> LockHolder {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(meta) = std::fs::metadata(owner_lock_path(socket_path)) else {
+        return LockHolder::Free;
+    };
+    let Ok(locks) = std::fs::read_to_string("/proc/locks") else {
+        return LockHolder::Unknown;
+    };
+    let dev = meta.dev();
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    let want = format!("{major:02x}:{minor:02x}:{}", meta.ino());
+    for line in locks.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // "1: FLOCK ADVISORY WRITE <pid> <maj>:<min>:<ino> 0 EOF"
+        if f.get(1) == Some(&"FLOCK") && f.get(5).is_some_and(|id| *id == want) {
+            return match f.get(4).and_then(|p| p.parse::<u32>().ok()) {
+                Some(pid) if pid != 0 => LockHolder::Pid(pid),
+                _ => LockHolder::Unknown,
+            };
+        }
+    }
+    LockHolder::Free
+}
+
 /// What a connect probe found at the socket path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketProbe {

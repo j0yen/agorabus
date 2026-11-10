@@ -293,28 +293,36 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
     // ── 4. Drain + bounce ─────────────────────────────────────────────────────
     let Some(old_pid) = daemon_pid else {
         // start_if_absent path: no existing daemon; just launch one.
-        let new_pid = launch_daemon(&discover_binary()?, &cfg.socket_path, &[])?;
+        let mut child = launch_daemon(&discover_binary()?, &cfg.socket_path, &[])?;
+        let new_pid = child.id();
+        let owned = confirm_owner(&mut child, &cfg.socket_path);
         let verdict = ReloadVerdict {
             old_pid: None,
-            new_pid: Some(new_pid),
+            new_pid: owned.then_some(new_pid),
             binary_before,
-            binary_after: Some("current".to_string()),
+            binary_after: owned.then(|| "current".to_string()),
             peers_before: vec![],
             peers_after: vec![],
             peers_recovered: vec![],
             peers_missing: vec![],
             elapsed_ms: elapsed_ms(start),
-            status: ReloadStatus::Reloaded,
+            status: if owned {
+                ReloadStatus::Reloaded
+            } else {
+                ReloadStatus::Failed
+            },
             build_command,
             install_dest,
             build_skipped: if cfg.build { Some(false) } else { None },
         };
-        return Ok((verdict, ExitCode::SUCCESS));
+        let code = if owned { ExitCode::SUCCESS } else { ExitCode::from(1) };
+        return Ok((verdict, code));
     };
 
     // Signal the old daemon, wait for it and for its owner lock, then launch.
-    // A lock still held at the bound means the old daemon keeps serving: no
-    // new daemon is launched and the reload fails.
+    // The old daemon drops its socket when signalled, so a lock that outlives
+    // the bound is cleared by killing the signalled pid before launching; a
+    // lock held by some other process fails the reload with no launch.
     let binary = discover_binary()?;
     let new_pid = match bounce_daemon(
         &cfg.socket_path,
@@ -327,7 +335,7 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
         },
     )? {
         Bounce::Launched(pid) => pid,
-        Bounce::LockHeld => {
+        Bounce::LockHeld | Bounce::NotOwner(_) => {
             let verdict = ReloadVerdict {
                 old_pid: Some(old_pid),
                 new_pid: None,
@@ -651,11 +659,19 @@ pub const OWNER_LOCK_EXTRA_WAIT: Duration = Duration::from_secs(10);
 /// Result of [`bounce_daemon`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bounce {
-    /// The lock was free; a new daemon was launched with this pid.
+    /// A new daemon was launched with this pid and confirmed as the owner
+    /// lock holder answering on the socket.
     Launched(u32),
-    /// The owner lock was still held at the bound; nothing was launched.
+    /// The owner lock was still held by another process at the bound, even
+    /// after the signalled daemon was killed; nothing was launched.
     LockHeld,
+    /// A daemon was launched with this pid but it is not the lock holder or
+    /// exited (it lost a race for the path); the holder, if any, serves.
+    NotOwner(u32),
 }
+
+/// How long a launched daemon gets to take the lock and answer.
+const LAUNCH_CONFIRM_WAIT: Duration = Duration::from_secs(10);
 
 /// Timing and launch settings for [`bounce_daemon`].
 #[derive(Debug, Clone, Copy)]
@@ -673,11 +689,21 @@ pub struct BounceOpts<'a> {
 /// SIGTERM `old_pid`, wait for it and its owner lock, then launch.
 ///
 /// Waits up to `drain_timeout` for the pid to exit, then up to `extra_wait`
-/// more for the owner lock on `socket_path` to be free.
+/// more for the owner lock on `socket_path` to be free. The old daemon drops
+/// its socket as soon as it is signalled, so a lock that outlives the bound
+/// would leave the bus with no daemon: if the signalled pid is still alive
+/// and is an `agorabus` process it is killed (the kernel then frees the
+/// lock), and the new daemon is launched as usual.
 ///
-/// If the lock is still held at the bound, nothing is launched, one line
-/// naming the pid and the lock path goes to stderr, and `Bounce::LockHeld` is
-/// returned; the old daemon is left as it is.
+/// The probe reads `/proc/locks` and never holds the lock, so a unit instance
+/// starting at the same time is not made to exit by it.
+///
+/// If the lock is still held by another process after that, nothing is
+/// launched and `Bounce::LockHeld` is returned; the holder is the live owner
+/// and the stderr line says whether the socket answers.
+///
+/// A launched daemon is returned as `Bounce::Launched` only once it holds the
+/// owner lock and the socket answers; otherwise `Bounce::NotOwner`.
 ///
 /// # Errors
 ///
@@ -701,22 +727,121 @@ pub fn bounce_daemon(
             drain_timeout.as_millis()
         );
     }
-    let deadline = Instant::now() + extra_wait;
-    loop {
-        // Probe and release at once: the new daemon takes the lock itself.
-        if daemon::acquire_owner_lock(socket_path)?.is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
+    if !wait_lock_free(socket_path, extra_wait)? {
+        // The old daemon has already removed its socket; leaving it wedged
+        // in its drain would leave no daemon at all.
+        if process_is_agorabus(old_pid) {
             eprintln!(
-                "agorabus reload: owner lock {} still held (old daemon pid {old_pid}); not launching, old daemon left running",
-                daemon::owner_lock_path(socket_path).display()
+                "agorabus reload: owner lock {} still held after {}ms; killing the signalled daemon (pid {old_pid}) so a successor can start",
+                daemon::owner_lock_path(socket_path).display(),
+                (drain_timeout + extra_wait).as_millis()
+            );
+            kill_pid(old_pid)?;
+            wait_for_exit(old_pid, KILL_WAIT);
+        }
+        if !wait_lock_free(socket_path, KILL_WAIT)? {
+            eprintln!(
+                "agorabus reload: owner lock {} is held by {:?}, not the signalled daemon (pid {old_pid}); not launching. Socket {} answers: {}",
+                daemon::owner_lock_path(socket_path).display(),
+                daemon::owner_lock_holder(socket_path),
+                socket_path.display(),
+                socket_answers(socket_path)
             );
             return Ok(Bounce::LockHeld);
         }
+    }
+    let mut child = launch_daemon(binary, socket_path, extra_args)?;
+    let pid = child.id();
+    if confirm_owner(&mut child, socket_path) {
+        Ok(Bounce::Launched(pid))
+    } else {
+        eprintln!(
+            "agorabus reload: launched daemon (pid {pid}) is not the owner of {} (lock holder {:?}); socket answers: {}",
+            socket_path.display(),
+            daemon::owner_lock_holder(socket_path),
+            socket_answers(socket_path)
+        );
+        Ok(Bounce::NotOwner(pid))
+    }
+}
+
+/// Wait after SIGKILL for the process and then the lock to go away.
+const KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// Poll until nobody holds the owner lock or `wait` elapses.
+///
+/// Reads `/proc/locks`; when that cannot name a holder it falls back to
+/// taking and dropping the lock.
+fn wait_lock_free(socket_path: &Path, wait: Duration) -> Result<bool> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let free = match daemon::owner_lock_holder(socket_path) {
+            daemon::LockHolder::Free => true,
+            daemon::LockHolder::Pid(_) => false,
+            daemon::LockHolder::Unknown => daemon::acquire_owner_lock(socket_path)?.is_some(),
+        };
+        if free {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Ok(Bounce::Launched(launch_daemon(binary, socket_path, extra_args)?))
+}
+
+/// True when `/proc/<pid>/cmdline` names an `agorabus` process.
+fn process_is_agorabus(pid: u32) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .is_ok_and(|raw| String::from_utf8_lossy(&raw).contains("agorabus"))
+}
+
+/// True when a connection to `socket_path` is accepted.
+fn socket_answers(socket_path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+}
+
+/// Wait until `child` holds the owner lock and the socket answers.
+///
+/// False if it exits first, another pid holds the lock, or the wait runs out.
+fn confirm_owner(child: &mut std::process::Child, socket_path: &Path) -> bool {
+    let pid = child.id();
+    let deadline = Instant::now() + LAUNCH_CONFIRM_WAIT;
+    loop {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return false;
+        }
+        let owns = match daemon::owner_lock_holder(socket_path) {
+            daemon::LockHolder::Pid(p) => {
+                if p != pid {
+                    return false;
+                }
+                true
+            }
+            daemon::LockHolder::Unknown => true,
+            daemon::LockHolder::Free => false,
+        };
+        if owns && socket_answers(socket_path) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Send SIGKILL to `pid` via the system `kill` utility.
+fn kill_pid(pid: u32) -> Result<()> {
+    let output = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to invoke kill(1): {e}"))?;
+    if output.status.success() || !Path::new(&format!("/proc/{pid}")).exists() {
+        Ok(())
+    } else {
+        bail!("kill -KILL {pid} failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
 }
 
 /// Send SIGTERM to `pid` via the system `kill` utility.
@@ -758,18 +883,22 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
 /// Uses the currently-executing binary (which, after `install.sh`, is the
 /// fresh on-disk binary) launched via `nohup` with `setsid` to fully detach.
 ///
-/// Returns the new process PID.
+/// Returns the spawned child (the caller confirms it owns the socket).
 ///
 /// # Errors
 ///
 /// Returns `Err` if the binary cannot be resolved or the process cannot be
 /// spawned.
-fn launch_daemon(binary: &Path, socket_path: &Path, extra_args: &[String]) -> Result<u32> {
+fn launch_daemon(
+    binary: &Path,
+    socket_path: &Path,
+    extra_args: &[String],
+) -> Result<std::process::Child> {
     let socket_str = socket_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("socket path is not valid UTF-8"))?;
 
-    let child = std::process::Command::new("nohup")
+    std::process::Command::new("nohup")
         .args([
             binary.to_str().unwrap_or("agorabus"),
             "--socket",
@@ -781,9 +910,7 @@ fn launch_daemon(binary: &Path, socket_path: &Path, extra_args: &[String]) -> Re
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn nohup agorabus daemon: {e}"))?;
-
-    Ok(child.id())
+        .map_err(|e| anyhow::anyhow!("failed to spawn nohup agorabus daemon: {e}"))
 }
 
 /// Resolve the path of the installed `agorabus` binary.
