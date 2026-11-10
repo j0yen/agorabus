@@ -180,10 +180,11 @@ fn lock_held_past_bound_leaves_a_serving_daemon() {
             extra_wait: Duration::from_millis(600),
             binary: &bin(),
             extra_args: &sb.daemon_args(),
+            home: Some(&sb.tmp.path().join("home")),
         },
     )
     .unwrap();
-    if let Bounce::Launched(new) = out {
+    if let Bounce::Launched(new) | Bounce::NotOwner(new) = out {
         pids.track(new);
     }
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -212,9 +213,13 @@ fn launched_pid_is_the_serving_daemon() {
             extra_wait: Duration::from_secs(5),
             binary: &bin(),
             extra_args: &sb.daemon_args(),
+            home: Some(&sb.tmp.path().join("home")),
         },
     )
     .unwrap();
+    if let Bounce::NotOwner(p) = out {
+        pids.track(p);
+    }
     let Bounce::Launched(new) = out else {
         panic!("expected Launched, got {out:?}");
     };

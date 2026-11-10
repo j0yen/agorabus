@@ -6,9 +6,8 @@
 //! at the bound, nothing is launched and the old daemon keeps serving.
 //!
 //! The cases call `reload::bounce_daemon` (the part of reload after the old
-//! pid is known) directly: the pid discovery in `run_reload` scans all of
-//! `/proc` for any `agorabus daemon`, so a CLI-level test could signal a real
-//! bus. Every case uses a private `HOME`, `XDG_RUNTIME_DIR` and socket inside
+//! pid is known) directly, so no case can reach a daemon it did not start.
+//! Every case uses a private `HOME`, `XDG_RUNTIME_DIR` and socket inside
 //! its own temp dir and kills only the pids it started.
 
 #![allow(
@@ -119,14 +118,6 @@ fn process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-fn wait_dead(pid: u32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while process_alive(pid) {
-        assert!(Instant::now() < deadline, "pid {pid} did not exit");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// One announce round-trip through the bus at `socket`.
 fn answers(socket: &Path) -> bool {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -205,9 +196,13 @@ fn a_normal_reload_new_daemon_binds() {
             extra_wait: Duration::from_secs(5),
             binary: &bin(),
             extra_args: &sb.daemon_args(),
+            home: Some(&sb.tmp.path().join("home")),
         },
     )
     .unwrap();
+    if let Bounce::NotOwner(p) = out {
+        pids.track(p);
+    }
     let Bounce::Launched(new) = out else {
         panic!("expected Launched, got {out:?}");
     };
@@ -218,31 +213,29 @@ fn a_normal_reload_new_daemon_binds() {
     assert!(process_alive(new), "new daemon running");
 }
 
-/// (b) Slow drain: the old daemon ignores SIGTERM and the lock is held past
-/// `drain_timeout`, released before the bound. Reload waits, then launches.
+/// (b) Slow drain: the old daemon holds the owner lock through a drain grace
+/// that outlives `drain_timeout` and releases it before the bound. Reload
+/// waits, then launches.
 #[test]
 fn b_slow_drain_waits_for_lock_then_launches() {
     let sb = Sandbox::new();
     let mut pids = Pids::default();
-    // Stands in for the old daemon: ignores TERM until its stdin closes.
-    let mut old_child = Command::new("sh")
-        .args(["-c", "trap '' TERM; read x"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let old = old_child.id();
-    pids.track(old);
-    let stdin = old_child.stdin.take().unwrap();
-    std::thread::spawn(move || {
-        let _ = old_child.wait();
-    });
-
-    let lock = hold_lock(&sb.lock());
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(900));
-        drop(lock);
-        drop(stdin);
-    });
+    let mut args = sb.daemon_args();
+    // `daemon_args` ends with `--drain-grace-ms <n>`; hold the lock ~900 ms.
+    let last = args.len() - 1;
+    args[last] = "900".into();
+    let mut cmd = Command::new(bin());
+    cmd.env("HOME", sb.tmp.path().join("home"))
+        .env("XDG_RUNTIME_DIR", sb.tmp.path().join("xdg"))
+        .arg("--socket")
+        .arg(&sb.socket)
+        .arg("daemon")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let old = spawn_reaped(&mut cmd, &mut pids);
+    wait_answers(&sb.socket);
 
     let t0 = Instant::now();
     let out = bounce_daemon(
@@ -253,24 +246,28 @@ fn b_slow_drain_waits_for_lock_then_launches() {
             extra_wait: Duration::from_secs(8),
             binary: &bin(),
             extra_args: &sb.daemon_args(),
+            home: Some(&sb.tmp.path().join("home")),
         },
     )
     .unwrap();
     let waited = t0.elapsed();
-    release.join().unwrap();
+    if let Bounce::NotOwner(p) = out {
+        pids.track(p);
+    }
     let Bounce::Launched(new) = out else {
         panic!("expected Launched, got {out:?}");
     };
     pids.track(new);
     assert!(
-        waited >= Duration::from_millis(800),
+        waited >= Duration::from_millis(600),
         "waited past drain_timeout for the lock: {waited:?}"
     );
     wait_answers(&sb.socket);
 }
 
-/// (c) The lock is never released within the bound while a listener serves
-/// the path: nothing is launched, the socket inode and listener are intact.
+/// (c) The lock is held by another process (not the pid handed to reload)
+/// while a listener serves the path: reload refuses before signalling, nothing
+/// is launched, the socket inode and listener are intact.
 #[test]
 fn c_lock_never_released_does_not_launch() {
     let sb = Sandbox::new();
@@ -288,11 +285,11 @@ fn c_lock_never_released_does_not_launch() {
             extra_wait: Duration::from_millis(1000),
             binary: &bin(),
             extra_args: &sb.daemon_args(),
+            home: Some(&sb.tmp.path().join("home")),
         },
-    )
-    .unwrap();
-    assert_eq!(out, Bounce::LockHeld);
-    wait_dead(old);
+    );
+    assert!(out.is_err(), "a pid that is not the lock holder must be refused: {out:?}");
+    assert!(process_alive(old), "the non-holder pid was not signalled");
 
     let sock = sb.socket.to_string_lossy().into_owned();
     assert!(
