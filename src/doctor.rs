@@ -93,9 +93,16 @@ pub struct DoctorReport {
 /// `installed_path` is the path of the `agorabus` binary on disk (i.e. the one
 /// to compare against).  When `None` the function attempts to discover it via
 /// `which agorabus` / the current executable.
+#[must_use]
 pub fn run_doctor(installed_path: Option<&Path>) -> (DoctorReport, ExitCode) {
-    // 1. Find the daemon pid.
-    let daemon_pid = find_daemon_pid();
+    run_doctor_for(installed_path, find_daemon_pid())
+}
+
+/// [`run_doctor`] for a caller-chosen daemon pid (for example the owner of one
+/// socket's lock) instead of the lowest `agorabus daemon` pid on the host.
+#[must_use]
+pub fn run_doctor_for(installed_path: Option<&Path>, daemon_pid: Option<u32>) -> (DoctorReport, ExitCode) {
+    // 1. The daemon pid.
 
     let Some(pid) = daemon_pid else {
         let report = DoctorReport {
@@ -228,13 +235,18 @@ fn is_agorabus_daemon(pid: u32) -> bool {
     };
     // cmdline is NUL-separated: argv[0]\0argv[1]\0…
     let args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
-    let (Some(first), Some(second)) = (args.first(), args.get(1)) else {
+    let Some(first) = args.first() else {
         return false;
     };
     let argv0 = String::from_utf8_lossy(first);
-    let argv1 = String::from_utf8_lossy(second);
-    // Match "agorabus" (any path suffix) + first arg == "daemon"
-    argv0.ends_with("agorabus") && argv1 == "daemon"
+    // Match "agorabus" (any path suffix) with the `daemon` subcommand either
+    // first (`agorabus daemon`) or after global flags, as launch_daemon
+    // starts it (`agorabus --socket <path> daemon`).
+    argv0.ends_with("agorabus")
+        && args
+            .iter()
+            .skip(1)
+            .any(|a| String::from_utf8_lossy(a) == "daemon")
 }
 
 /// Read the raw symlink target of `/proc/<pid>/exe`.

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — A1532
+
+reload no longer leaves the bus without a daemon. The old daemon removes its socket when signalled, so a reload whose owner lock outlived drain+10 s used to return `LockHeld` with no socket and no successor. Now the signalled pid, if still an `agorabus` process at the bound, is killed so the lock frees and the successor launches; a lock held by any other process fails the reload with a stderr line saying who holds it and whether the socket answers. A reload returns success only after the launched pid holds the owner lock and the socket answers (`Bounce::NotOwner` otherwise). The lock probe reads `/proc/locks` instead of taking the lock, so a unit instance starting meanwhile is not made to exit 0. `agorabus daemon` registers SIGINT/SIGTERM before loading config. README: systemd notes on a daemon started outside the unit.
+
 ## v0.13.2 — 2026-09-19
 
 Fix main-ci-red: clear 16 blocking bad-rust-audit findings (unsafe blocks missing a directly-preceding SAFETY: comment, and .unwrap() on test-fixture literals misclassified as external-input) so the autobuilder gate's bad-rust audit step passes on main (PRD-agorabus-health-main-ci-red-20260918).

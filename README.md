@@ -161,3 +161,9 @@ agorabus is the single-host coordination layer of the wintermute fleet. Local pe
 ## License
 
 Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+
+## Running under systemd
+
+One daemon owns a socket path, enforced by `<socket>.lock` (`flock`, held for the daemon's whole life). A second `agorabus daemon` on the same path logs `another daemon holds <socket>.lock; not starting` to stderr and exits 0, so a unit with `Restart=on-failure` does not loop.
+
+Consequence: if a daemon was started outside the unit (`nohup agorabus daemon`, or a build from before the lock existed), `systemctl restart agorabus` exits 0 while that older process keeps serving, possibly a stale binary. Check the unit journal for the `not starting` line, or run `agorabus doctor` (reports a stale executable). `agorabus reload` signals the serving daemon itself and, if it has not released the lock after drain plus 10 s, kills it so the successor can start. Stop the stray process before enabling the unit.

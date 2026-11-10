@@ -39,7 +39,7 @@ use agorabus::{
     reload::{ReloadConfig, ReloadFormat, print_verdict, run_reload},
 };
 use tokio::time::{Instant, timeout};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -343,6 +343,12 @@ fn main() -> ExitCode {
 async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
     match cmd {
         Command::Daemon { heartbeat_timeout, drain_grace_ms, drain_resume_hint_ms, state_file, state_flush_ms, uplink_config } => {
+            // Register the handlers first: a SIGTERM that arrives while the
+            // config loads or the daemon task starts must reach the graceful
+            // shutdown arm, not the default (kill) action.
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigint = signal(SignalKind::interrupt())?;
+            let mut sigterm = signal(SignalKind::terminate())?;
             let uplink = load_uplink_config(&uplink_config.unwrap_or_else(default_uplink_config_path));
             let cfg = DaemonConfig {
                 socket_path: socket,
@@ -356,15 +362,18 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             };
             let (_ready_tx, _ready_rx) = tokio::sync::oneshot::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let daemon = tokio::spawn(async move { run_daemon(cfg, None, shutdown_rx).await });
+            let mut daemon = tokio::spawn(async move { run_daemon(cfg, None, shutdown_rx).await });
 
-            // Wait for SIGINT / SIGTERM, then signal shutdown.
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigint = signal(SignalKind::interrupt())?;
-            let mut sigterm = signal(SignalKind::terminate())?;
+            // Wait for SIGINT / SIGTERM, then signal shutdown. A daemon that
+            // returns first never bound: Ok = another owner already serves
+            // the socket (exit 0), Err = refused or failed to bind (exit 2).
             tokio::select! {
                 _ = sigint.recv() => {}
                 _ = sigterm.recv() => {}
+                early = &mut daemon => {
+                    early.context("daemon task")??;
+                    return Ok(ExitCode::SUCCESS);
+                }
             }
             let _ = shutdown_tx.send(());
             let _ = daemon.await;
