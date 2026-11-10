@@ -203,20 +203,23 @@ enum Command {
         /// Output shape: `text` (human table) or `json`.
         #[arg(long, default_value = "text")]
         format: String,
-        /// If set, skip the reload when the running binary is already current
-        /// (no-op guard). Enabled by default; pass `--no-require-fresh` to
-        /// bypass (e.g. for testing the bounce itself).
-        #[arg(long, default_value_t = true)]
-        require_fresh: bool,
+        /// Skip the reload when the running binary is already current (no-op
+        /// guard). On by default; pass `--no-require-fresh` to bypass (e.g.
+        /// for testing the bounce itself).
+        #[arg(long = "no-require-fresh", action = clap::ArgAction::SetTrue)]
+        no_require_fresh: bool,
         /// Start a new daemon even if none is currently running.
         #[arg(long, default_value_t = false)]
         start_if_absent: bool,
         /// Print the plan + freshness verdict + peer set that *would* be
-        /// bounced, without mutating anything. This is the default posture
-        /// (--dry-run true); pass `--no-dry-run` (or `--apply`) to perform
-        /// the actual reload.
-        #[arg(long, default_value_t = true)]
+        /// bounced, without mutating anything. This is the default posture;
+        /// the flag is accepted as a no-op and conflicts with `--apply`.
+        #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "apply")]
         dry_run: bool,
+        /// Perform the actual reload (bounce the daemon). Without it, reload
+        /// only prints the plan.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        apply: bool,
         /// Milliseconds to wait for the old daemon to exit after SIGTERM.
         #[arg(long, default_value_t = 2_000)]
         drain_timeout_ms: u64,
@@ -584,9 +587,10 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
         }
         Command::Reload {
             format,
-            require_fresh,
+            no_require_fresh,
             start_if_absent,
-            dry_run,
+            dry_run: _,
+            apply,
             drain_timeout_ms,
             reconnect_timeout_ms,
             installed_path,
@@ -598,9 +602,9 @@ async fn run(cmd: Command, socket: PathBuf) -> Result<ExitCode> {
             };
             let cfg = ReloadConfig {
                 socket_path: socket,
-                require_fresh,
+                require_fresh: !no_require_fresh,
                 start_if_absent,
-                dry_run,
+                dry_run: !apply,
                 drain_timeout_ms,
                 reconnect_timeout_ms,
                 format: fmt,
@@ -906,3 +910,42 @@ async fn run_intent(sub: IntentCommand, socket: &Path) -> Result<ExitCode> {
     }
 }
 
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::tests_outside_test_module)]
+mod reload_flag_tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    fn reload(args: &[&str]) -> Result<(bool, bool), clap::Error> {
+        let mut v = vec!["agorabus", "reload"];
+        v.extend_from_slice(args);
+        let cli = Cli::try_parse_from(v)?;
+        let Command::Reload { no_require_fresh, apply, .. } = cli.cmd else {
+            panic!("not reload");
+        };
+        Ok((!apply, !no_require_fresh))
+    }
+
+    #[test]
+    fn defaults_are_dry_run_and_require_fresh() {
+        assert_eq!(reload(&[]).unwrap(), (true, true));
+        assert_eq!(reload(&["--dry-run"]).unwrap(), (true, true));
+    }
+
+    #[test]
+    fn apply_clears_dry_run() {
+        assert_eq!(reload(&["--apply"]).unwrap(), (false, true));
+    }
+
+    #[test]
+    fn no_require_fresh_clears_require_fresh() {
+        assert_eq!(reload(&["--no-require-fresh"]).unwrap(), (true, false));
+    }
+
+    #[test]
+    fn apply_conflicts_with_dry_run() {
+        let e = reload(&["--apply", "--dry-run"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+}
