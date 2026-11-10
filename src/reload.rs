@@ -28,6 +28,7 @@
 #![allow(clippy::struct_excessive_bools)]
 #![allow(clippy::doc_markdown)]
 
+use crate::daemon;
 use crate::doctor::{self, Verdict};
 use crate::Client;
 use anyhow::{Result, bail};
@@ -292,7 +293,7 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
     // ── 4. Drain + bounce ─────────────────────────────────────────────────────
     let Some(old_pid) = daemon_pid else {
         // start_if_absent path: no existing daemon; just launch one.
-        let new_pid = launch_daemon(&cfg.socket_path)?;
+        let new_pid = launch_daemon(&discover_binary()?, &cfg.socket_path, &[])?;
         let verdict = ReloadVerdict {
             old_pid: None,
             new_pid: Some(new_pid),
@@ -311,20 +312,40 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
         return Ok((verdict, ExitCode::SUCCESS));
     };
 
-    // Send SIGTERM to the old daemon.
-    send_sigterm(old_pid)?;
-
-    // Wait for old process to exit (bounded).
-    let drained = wait_for_exit(old_pid, Duration::from_millis(cfg.drain_timeout_ms));
-    if !drained {
-        eprintln!(
-            "agorabus reload: old daemon (pid {old_pid}) did not exit within {}ms; proceeding anyway",
-            cfg.drain_timeout_ms
-        );
-    }
-
-    // Launch the fresh daemon.
-    let new_pid = launch_daemon(&cfg.socket_path)?;
+    // Signal the old daemon, wait for it and for its owner lock, then launch.
+    // A lock still held at the bound means the old daemon keeps serving: no
+    // new daemon is launched and the reload fails.
+    let binary = discover_binary()?;
+    let new_pid = match bounce_daemon(
+        &cfg.socket_path,
+        old_pid,
+        &BounceOpts {
+            drain_timeout: Duration::from_millis(cfg.drain_timeout_ms),
+            extra_wait: OWNER_LOCK_EXTRA_WAIT,
+            binary: &binary,
+            extra_args: &[],
+        },
+    )? {
+        Bounce::Launched(pid) => pid,
+        Bounce::LockHeld => {
+            let verdict = ReloadVerdict {
+                old_pid: Some(old_pid),
+                new_pid: None,
+                binary_before,
+                binary_after: None,
+                peers_before,
+                peers_after: vec![],
+                peers_recovered: vec![],
+                peers_missing: vec![],
+                elapsed_ms: elapsed_ms(start),
+                status: ReloadStatus::Failed,
+                build_command,
+                install_dest,
+                build_skipped: if cfg.build { Some(false) } else { None },
+            };
+            return Ok((verdict, ExitCode::from(1)));
+        }
+    };
 
     // ── 5. Confirm: poll socket + peers ──────────────────────────────────────
     let deadline = Instant::now() + Duration::from_millis(cfg.reconnect_timeout_ms);
@@ -623,6 +644,81 @@ async fn snapshot_peers(socket: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+/// Extra time, beyond `drain_timeout_ms`, to wait for the old daemon's owner
+/// lock to be released before reload gives up without launching.
+pub const OWNER_LOCK_EXTRA_WAIT: Duration = Duration::from_secs(10);
+
+/// Result of [`bounce_daemon`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bounce {
+    /// The lock was free; a new daemon was launched with this pid.
+    Launched(u32),
+    /// The owner lock was still held at the bound; nothing was launched.
+    LockHeld,
+}
+
+/// Timing and launch settings for [`bounce_daemon`].
+#[derive(Debug, Clone, Copy)]
+pub struct BounceOpts<'a> {
+    /// How long to wait for the old pid to exit.
+    pub drain_timeout: Duration,
+    /// Further wait for the owner lock to be free.
+    pub extra_wait: Duration,
+    /// Daemon binary to launch.
+    pub binary: &'a Path,
+    /// Arguments appended after `daemon`.
+    pub extra_args: &'a [String],
+}
+
+/// SIGTERM `old_pid`, wait for it and its owner lock, then launch.
+///
+/// Waits up to `drain_timeout` for the pid to exit, then up to `extra_wait`
+/// more for the owner lock on `socket_path` to be free.
+///
+/// If the lock is still held at the bound, nothing is launched, one line
+/// naming the pid and the lock path goes to stderr, and `Bounce::LockHeld` is
+/// returned; the old daemon is left as it is.
+///
+/// # Errors
+///
+/// Fails if the signal, the lock probe or the launch fails.
+pub fn bounce_daemon(
+    socket_path: &Path,
+    old_pid: u32,
+    opts: &BounceOpts<'_>,
+) -> Result<Bounce> {
+    let BounceOpts {
+        drain_timeout,
+        extra_wait,
+        binary,
+        extra_args,
+    } = *opts;
+    send_sigterm(old_pid)?;
+    let drained = wait_for_exit(old_pid, drain_timeout);
+    if !drained {
+        eprintln!(
+            "agorabus reload: old daemon (pid {old_pid}) did not exit within {}ms; waiting for its owner lock",
+            drain_timeout.as_millis()
+        );
+    }
+    let deadline = Instant::now() + extra_wait;
+    loop {
+        // Probe and release at once: the new daemon takes the lock itself.
+        if daemon::acquire_owner_lock(socket_path)?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "agorabus reload: owner lock {} still held (old daemon pid {old_pid}); not launching, old daemon left running",
+                daemon::owner_lock_path(socket_path).display()
+            );
+            return Ok(Bounce::LockHeld);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(Bounce::Launched(launch_daemon(binary, socket_path, extra_args)?))
+}
+
 /// Send SIGTERM to `pid` via the system `kill` utility.
 ///
 /// We avoid a libc/nix crate dependency by shelling out to `/usr/bin/kill`.
@@ -668,8 +764,7 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
 ///
 /// Returns `Err` if the binary cannot be resolved or the process cannot be
 /// spawned.
-fn launch_daemon(socket_path: &Path) -> Result<u32> {
-    let binary = discover_binary()?;
+fn launch_daemon(binary: &Path, socket_path: &Path, extra_args: &[String]) -> Result<u32> {
     let socket_str = socket_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("socket path is not valid UTF-8"))?;
@@ -681,6 +776,7 @@ fn launch_daemon(socket_path: &Path) -> Result<u32> {
             socket_str,
             "daemon",
         ])
+        .args(extra_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
