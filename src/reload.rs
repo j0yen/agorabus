@@ -171,6 +171,29 @@ impl Default for ReloadConfig {
 /// distinct from expected "no daemon" scenarios, which produce a `Failed`
 /// verdict instead).
 pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)> {
+    run_reload_with(cfg, &ReloadSeams::default()).await
+}
+
+/// Test seams for [`run_reload_with`]; the default changes nothing.
+#[derive(Default, Clone, Copy)]
+pub struct ReloadSeams<'a> {
+    /// Maps the pid discovery found to the pid the reload acts on, applied
+    /// between discovery and the pre-signal re-check (simulates a pid that was
+    /// recycled or re-purposed after discovery).
+    pub discovered_pid: Option<&'a (dyn Fn(Option<u32>) -> Option<u32> + Sync)>,
+    /// Daemon binary to launch instead of the current executable.
+    pub binary: Option<&'a Path>,
+}
+
+/// [`run_reload`] with [`ReloadSeams`].
+///
+/// # Errors
+///
+/// See [`run_reload`].
+pub async fn run_reload_with(
+    cfg: &ReloadConfig,
+    seams: &ReloadSeams<'_>,
+) -> Result<(ReloadVerdict, ExitCode)> {
     let start = Instant::now();
 
     // ── Resolve build metadata (if --build) ───────────────────────────────────
@@ -186,7 +209,10 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
     // ── 1. Pre-flight: find daemon pid ────────────────────────────────────────
     let (doctor_report, _doctor_code) = doctor::run_doctor_for_socket(cfg.installed_path.as_deref(), &cfg.socket_path);
 
-    let daemon_pid = doctor_report.daemon_pid;
+    let daemon_pid = match seams.discovered_pid {
+        Some(f) => f(doctor_report.daemon_pid),
+        None => doctor_report.daemon_pid,
+    };
 
     // Pre-flight failure: no daemon, not allowed to start one.
     // Exception: `--build --dry-run` is a plan-only operation; emit the
@@ -315,7 +341,7 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
         let Bounce::Launched(new_pid) = start_daemon_if_lock_free(
             &cfg.socket_path,
             OWNER_LOCK_EXTRA_WAIT,
-            &discover_binary()?,
+            &seam_binary(seams)?,
             &[],
         ) else {
             return Ok((failed(None, None, vec![]), ExitCode::from(1)));
@@ -348,7 +374,7 @@ pub async fn run_reload(cfg: &ReloadConfig) -> Result<(ReloadVerdict, ExitCode)>
     // Signal the old daemon, wait for it and for its owner lock, then launch.
     // A lock still held at the bound means the old daemon keeps serving: no
     // new daemon is launched and the reload fails.
-    let binary = discover_binary()?;
+    let binary = seam_binary(seams)?;
     if let Err(why) = recheck_daemon_pid(old_pid, &cfg.socket_path) {
         eprintln!("agorabus reload: {why}; not signalling");
         return Ok((failed(Some(old_pid), None, peers_before), ExitCode::from(1)));
@@ -958,6 +984,10 @@ fn launch_daemon(binary: &Path, socket_path: &Path, extra_args: &[String]) -> Re
         .map_err(|e| anyhow::anyhow!("failed to spawn nohup agorabus daemon: {e}"))?;
 
     Ok(child.id())
+}
+
+fn seam_binary(seams: &ReloadSeams<'_>) -> Result<PathBuf> {
+    seams.binary.map_or_else(discover_binary, |b| Ok(b.to_path_buf()))
 }
 
 /// Resolve the path of the installed `agorabus` binary.

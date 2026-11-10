@@ -257,8 +257,8 @@ fn daemon_cmdline_socket(raw: &[u8]) -> Option<DaemonSocket> {
     let mut args = raw
         .split(|b| *b == 0)
         .map(|a| String::from_utf8_lossy(a).into_owned());
-    // Match "agorabus" (any path suffix) as argv[0].
-    if !args.next()?.ends_with("agorabus") {
+    // argv[0] must be a path whose basename is exactly "agorabus".
+    if Path::new(&args.next()?).file_name() != Some(std::ffi::OsStr::new("agorabus")) {
         return None;
     }
     let mut socket = DaemonSocket::Default;
@@ -269,6 +269,9 @@ fn daemon_cmdline_socket(raw: &[u8]) -> Option<DaemonSocket> {
             let v = args.next().filter(|v| !v.is_empty())?;
             socket = DaemonSocket::Explicit(PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--socket=") {
+            if v.is_empty() {
+                return None;
+            }
             socket = DaemonSocket::Explicit(PathBuf::from(v));
         } else if seen_daemon {
             // Daemon's own flags and values.
@@ -420,6 +423,18 @@ mod tests {
             sock("/a/2")
         );
         assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket\0"), None);
+        // An empty value is the same in both spellings.
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket=\0"), None);
+        assert_eq!(daemon_cmdline_socket(b"agorabus\0daemon\0--socket\0\0"), None);
+    }
+
+    #[test]
+    fn cmdline_argv0_is_basename_equality() {
+        let sock = |s: &str| Some(DaemonSocket::Explicit(PathBuf::from(s)));
+        assert_eq!(daemon_cmdline_socket(b"/usr/bin/agorabus\0daemon\0--socket\0/a/s\0"), sock("/a/s"));
+        assert_eq!(daemon_cmdline_socket(b"/usr/bin/notagorabus\0daemon\0--socket\0/a/s\0"), None);
+        assert_eq!(daemon_cmdline_socket(b"notagorabus\0daemon\0--socket\0/a/s\0"), None);
+        assert_eq!(daemon_cmdline_socket(b"/x/agorabus-old\0daemon\0--socket\0/a/s\0"), None);
     }
 
     #[test]
